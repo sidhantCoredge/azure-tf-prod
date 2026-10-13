@@ -858,8 +858,7 @@ For a deployment day, enabling logging first is strongly recommended.
 ### 12.4 What Terraform Does Not Do
 
 After `terraform apply` completes, the environment is **not ready**. These steps
-are manual, and the 31 scripts for them live only on the jumphost, **not in any
-repository**:
+are manual:
 
 | Step | Script / artifact |
 |---|---|
