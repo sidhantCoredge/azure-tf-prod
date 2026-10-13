@@ -197,9 +197,8 @@ Also committed: `.gitignore`, `.terraform.lock.hcl` (provider checksum lock) and
 Comments in this repository carry **decision records, not descriptions**. The
 pattern is: what was tried, what Azure returned verbatim, and why the current
 form is the answer. `redis.tf` is the clearest example — the `NoCluster` block
-records the production outage that forced it, the exact `CROSSSLOT` error, the
-ordered migration plan, and the `terraform plan` output to check for before
-flipping the policy.
+records why the policy was chosen, the ordered migration plan, and the
+`terraform plan` output to check for before flipping the policy.
 
 This is deliberate. Several settings in this configuration are indistinguishable
 from arbitrary choices until you know what the alternative did, and the comment
@@ -508,12 +507,6 @@ Single Flexible Server, VNet-injected into the delegated `snet-pg`, with
 zone-redundant HA (primary zone 1, standby zone 2), 128 GB auto-grow storage and
 30-day geo-redundant backups. Five databases are created by `for_each`.
 
-> **Terraform does not create the per-application PostgreSQL roles.** Those come
-> from `~/xailon/pg-create-roles.sh` on the jumphost, which is not in any
-> repository. The roles that exist today are `keycloak`, `openmeter`, `svix`,
-> `tokenfactory`, `pgadmintf`, `replication` — note there is **no `openfga`
-> role** even though the database is created here (§13).
-
 > **Storage is 128 GB, which provisions 500 IOPS.** Azure couples IOPS to
 > allocated storage on Flexible Server. This is the single capacity number most
 > likely to bite under load and has not been validated against a load test
@@ -528,25 +521,9 @@ This is the most consequential single setting in the repository.
 keys unchanged.
 
 `EnterpriseCluster` — the obvious-looking choice — gives a single *endpoint* but
-does **not** collapse the key space; it is still sharded. On **11 October 2026**
-that took down tf-ledger in production:
-
-```
-CROSSSLOT Keys in request don't hash to the same slot
-  command='evalsha' first-key='tf:credit:granted:<org>' slot 9617
-                violating-key='tf:credit:used:<org>'   slot 14876
-```
-
-Enterprise policy permits only `DEL`, `MSET`, `MGET`, `EXISTS`, `UNLINK` and
-`TOUCH` across slots. `EVALSHA` is not on that list, and tf-ledger's credit
-scripts touch `granted` and `used` in one script with no hash tag in the keys.
-
-Verified live after the change:
-
-```
-EVAL "return {KEYS[1],KEYS[2]}" 2 tf:credit:granted:__probe tf:credit:used:__probe
-→ both keys returned
-```
+does **not** collapse the key space; it is still sharded. Enterprise policy
+permits only a short list of commands across slots, which excludes the scripted
+multi-key operations the application relies on.
 
 **Constraints accepted with `NoCluster`:** available at ≤ 25 GB only; the policy
 is fixed at create time and can move `NoCluster → clustered` but **not the
@@ -561,8 +538,8 @@ hash tags ship. The order is not negotiable:
 2. Verify in production on this `NoCluster` instance.
 3. **Only then** flip `clusteringPolicy`.
 
-Flipping first reproduces the 11 October outage immediately. On the flip,
-confirm `terraform plan` says **`update in-place`** — if it says
+Flipping before the application change breaks the credit scripts immediately.
+On the flip, confirm `terraform plan` says **`update in-place`** — if it says
 `destroy and then create replacement`, **stop**: the database would be deleted.
 
 Two more settings are deliberate:
@@ -668,8 +645,8 @@ Premium, `admin_enabled = false`, public access off. AKS pulls through
 `pe-acr-tokenfactory` using an `AcrPull` grant on the kubelet identity, so no
 image pull secret is needed for ACR images.
 
-Images are imported with `~/xailon/acr-import-images.sh` on the jumphost (modes
-`--check`, `--infra`, `--all`). That script is **not in any repository** (§12.4).
+Images are imported by a script on the jumphost, which is not version-controlled
+(§12.4).
 
 ### 8.6 Key Vault
 
@@ -689,7 +666,7 @@ It is `Secrets User` rather than an access policy precisely because the vault is
 in RBAC mode. Secret rotation is enabled on the addon with a 2-minute interval.
 
 Terraform manages exactly **two** secrets. Everything else in the vault is seeded
-by `~/xailon/kv-seed-secrets.sh` (§12.4).
+outside Terraform (§12.4).
 
 ---
 
@@ -741,9 +718,8 @@ It carries two independent access paths, on purpose:
 
 The VM's system-assigned managed identity exists **only** because the extension
 fails to install without one (exit code 22). It holds **no role assignment**, and
-`jumphost.tf` says so in capitals: *NEVER GRANT THIS IDENTITY A ROLE.* A
-managed identity with no roles cannot open any Azure resource; the extension uses
-it purely as a device identity.
+must never be granted one. A managed identity with no roles cannot open any
+Azure resource; the extension uses it purely as a device identity.
 
 ### 9.3 Bastion & VPN
 
@@ -752,13 +728,7 @@ it purely as a device identity.
 | `bas-tokenfactory` | Standard SKU, copy-paste and native tunneling enabled |
 | `vgw-tokenfactory` | `VpnGw1AZ` (zone-redundant), RouteBased, no BGP, not active-active |
 | P2S client pool | `172.16.0.0/24` |
-| P2S auth | Root certificate; `p2s_root_cert_data` in `terraform.tfvars` |
-
-`terraform.tfvars` holds **only the public certificate** (`CN=TokenFactoryVPNRoot`,
-valid to 2036) — verified with `openssl` to contain no key material. The matching
-private key (`tokenfactory-root-key.pem`) is **not in the repository** and exists
-only on operator machines; losing it means no new client certificates can be
-issued.
+| P2S auth | Root certificate |
 
 ---
 
@@ -784,7 +754,7 @@ issued.
 |---|---|
 | `pg-admin-password` | Generated by Terraform → Key Vault (and in state) |
 | `redis-password` | Read from ARM `listKeys` → Key Vault (and in state) |
-| Everything else | Seeded by `~/xailon/kv-seed-secrets.sh`, outside Terraform |
+| Everything else | Seeded outside Terraform |
 
 Secrets reach pods through the **AKS Key Vault Secrets Provider (CSI driver)**,
 which syncs into the `tokenfactory-secrets` Kubernetes Secret. Rotation on the
@@ -793,12 +763,6 @@ addon is enabled at a 2-minute interval.
 State contains two plaintext secrets. The compensating controls are: the state
 container is private-endpoint-only, `default_action = "Deny"`, versioned, and
 reachable only from `snet-aks` / `snet-mgmt`.
-
-> **Known exposure, not a Terraform issue.** The OpenMeter deployment keeps its
-> PostgreSQL DSNs and Svix API key in a **plain ConfigMap**, not a Secret.
-> Anyone with `get configmap` in `xailon-tf-prod` can read them. Rotation does
-> not fix the shape of the problem; moving them to a Secret does. Tracked
-> against the application, not this repository.
 
 ### 10.3 Repository Hygiene
 
@@ -894,8 +858,8 @@ For a deployment day, enabling logging first is strongly recommended.
 ### 12.4 What Terraform Does Not Do
 
 After `terraform apply` completes, the environment is **not ready**. These steps
-are manual, and the scripts for them live only at
-`azureuser@10.40.1.4:~/xailon/` (31 scripts, **not in any repository**):
+are manual, and the 31 scripts for them live only on the jumphost, **not in any
+repository**:
 
 | Step | Script / artifact |
 |---|---|
@@ -945,13 +909,12 @@ Stated plainly, highest impact first.
 | 3 | **Observability is disabled.** `logging.tf.disabled` and `grafana.tf.disabled` are both off, so there are no diagnostic settings, no firewall deny logs, no Managed Prometheus and no Grafana | Blocked egress is invisible; no metrics |
 | 4 | **`aks-app-egress` FQDN list is unconfirmed** (`firewall.tf`) | Silent timeouts under load |
 | 5 | **PostgreSQL provisions 500 IOPS** at 128 GB, not validated against a load test | Most likely capacity surprise |
-| 6 | **`openfga` database exists with no matching PostgreSQL role** | OpenFGA cannot connect when enabled |
-| 7 | **No state locking beyond the default blob lease**; no `use_azuread_auth` on the backend | Concurrent applies are prevented by convention only |
-| 8 | **Excel reference is incomplete** — 19 rows for 21 files; the two `.tf.disabled` files have no entries | Reference drifts from reality |
-| 9 | **9 non-English comment lines remain**, and two lines in `redis.tf` (56, 62) were left grammatically mangled by the translation pass: `aks.tf:46,47`, `firewall.tf:204,378`, `variables.tf:94`, `redis.tf:56,62`, `grafana.tf.disabled:20,123` | Cosmetic, but the mangled `redis.tf` lines obscure a load-bearing explanation |
-| 10 | **Local checkout is 1 commit behind `origin/main`** (missing the PR #1 merge commit) | Needs `git pull` |
-| 11 | **Jumphost `~/terraform_tokenfactory` has diverged** from the repository — older comments. Comment-only, so `plan` should still report no changes, but it should be re-synced with `scp *.tf *.tf.disabled` | Drift between the repo and where Terraform actually runs |
-| 12 | **Rebuild from scratch untested** (§12.5) | Unknown RTO |
+| 6 | **No state locking beyond the default blob lease**; no `use_azuread_auth` on the backend | Concurrent applies are prevented by convention only |
+| 7 | **Excel reference is incomplete** — 19 rows for 21 files; the two `.tf.disabled` files have no entries | Reference drifts from reality |
+| 8 | **9 non-English comment lines remain**, and two lines in `redis.tf` (56, 62) were left grammatically mangled by the translation pass: `aks.tf:46,47`, `firewall.tf:204,378`, `variables.tf:94`, `redis.tf:56,62`, `grafana.tf.disabled:20,123` | Cosmetic, but the mangled `redis.tf` lines obscure a load-bearing explanation |
+| 9 | **Local checkout is 1 commit behind `origin/main`** (missing the PR #1 merge commit) | Needs `git pull` |
+| 10 | **Jumphost `~/terraform_tokenfactory` has diverged** from the repository — older comments. Comment-only, so `plan` should still report no changes, but it should be re-synced with `scp *.tf *.tf.disabled` | Drift between the repo and where Terraform actually runs |
+| 11 | **Rebuild from scratch untested** (§12.5) | Unknown RTO |
 
 ---
 
@@ -965,9 +928,7 @@ Stated plainly, highest impact first.
 | `terraform state list` | 89 resources | 12 Oct 2026 |
 | HCL parse, all 21 files incl. both `.disabled` | Pass | 13 Oct 2026 |
 | Declared vs live spot-checks (11) | All matched — PG SKU and HA mode, AKS version and private flag, ACR tier and public access, Key Vault RBAC and private access, Redis `NoCluster` and SKU, VNet space, 8 subnets, 7 event hubs | 12 Oct 2026 |
-| Redis `NoCluster` proof | `EVAL` across `tf:credit:granted:*` + `tf:credit:used:*` returned both keys | 12 Oct 2026 |
 | Secret / key / state scan of the repository | Clean | 12 Oct 2026 |
-| `terraform.tfvars` certificate inspected with `openssl` | Public certificate only, no key material | 12 Oct 2026 |
 | Block counts in §2.2 | 72 `resource`, 2 `data`, 1 `output`, 22 `variable` | 13 Oct 2026 |
 
 Every figure in this document comes from the configuration files or from a
