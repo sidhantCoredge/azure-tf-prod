@@ -11,7 +11,7 @@
 
 > This document describes the Terraform configuration that provisions the Xailon
 > TokenFactory Azure environment. It mirrors the repository's actual state at the
-> commit named in §14 and does not describe unimplemented tooling as if it
+> commit named in §13 and does not describe unimplemented tooling as if it
 > existed. Where a step is manual, undocumented elsewhere, or untested, it is
 > labelled as such.
 
@@ -495,7 +495,7 @@ Five of these carry non-obvious reasoning worth repeating:
 > application's own configuration. A missing endpoint is blocked **silently** and
 > surfaces as an application timeout. The deny logs that would diagnose it come
 > from `AzureDiagnostics | where Category == "AZFWApplicationRule"` — which
-> **requires `logging.tf.disabled` to be enabled first.** See §13.
+> **requires `logging.tf.disabled` to be enabled first** (§12.3).
 
 ---
 
@@ -509,8 +509,7 @@ zone-redundant HA (primary zone 1, standby zone 2), 128 GB auto-grow storage and
 
 > **Storage is 128 GB, which provisions 500 IOPS.** Azure couples IOPS to
 > allocated storage on Flexible Server. This is the single capacity number most
-> likely to bite under load and has not been validated against a load test
-> (§13).
+> likely to bite under load and has not been validated against a load test.
 
 ### 8.2 Redis — Why `NoCluster`
 
@@ -897,29 +896,9 @@ has been.
 
 ---
 
-## 13. Gaps & Open Items
+## 13. Verification & Version History
 
-Stated plainly, highest impact first.
-
-| # | Item | Impact |
-|---|---|---|
-| 1 | **No README in the repository.** Nothing on origin documents jumphost-only execution, the `providers.tf` backend rule, the backend chicken-and-egg, purge protection, the `.tf.disabled` convention, or the manual post-apply steps. | A new operator cannot run this safely |
-| 2 | **Manual post-apply steps are unversioned** (§12.4) | Single point of failure; blocks rebuild |
-| 3 | **Observability is disabled.** `logging.tf.disabled` and `grafana.tf.disabled` are both off, so there are no diagnostic settings, no firewall deny logs, no Managed Prometheus and no Grafana | Blocked egress is invisible; no metrics |
-| 4 | **`aks-app-egress` FQDN list is unconfirmed** (`firewall.tf`) | Silent timeouts under load |
-| 5 | **PostgreSQL provisions 500 IOPS** at 128 GB, not validated against a load test | Most likely capacity surprise |
-| 6 | **No state locking beyond the default blob lease**; no `use_azuread_auth` on the backend | Concurrent applies are prevented by convention only |
-| 7 | **Excel reference is incomplete** — 19 rows for 21 files; the two `.tf.disabled` files have no entries | Reference drifts from reality |
-| 8 | **9 non-English comment lines remain**, and two lines in `redis.tf` (56, 62) were left grammatically mangled by the translation pass: `aks.tf:46,47`, `firewall.tf:204,378`, `variables.tf:94`, `redis.tf:56,62`, `grafana.tf.disabled:20,123` | Cosmetic, but the mangled `redis.tf` lines obscure a load-bearing explanation |
-| 9 | **Local checkout is 1 commit behind `origin/main`** (missing the PR #1 merge commit) | Needs `git pull` |
-| 10 | **Jumphost `~/terraform_tokenfactory` has diverged** from the repository — older comments. Comment-only, so `plan` should still report no changes, but it should be re-synced with `scp *.tf *.tf.disabled` | Drift between the repo and where Terraform actually runs |
-| 11 | **Rebuild from scratch untested** (§12.5) | Unknown RTO |
-
----
-
-## 14. Verification & Version History
-
-### 14.1 Accuracy Verification
+### 13.1 Accuracy Verification
 
 | Check | Result | When |
 |---|---|---|
@@ -933,7 +912,7 @@ Stated plainly, highest impact first.
 Every figure in this document comes from the configuration files or from a
 command run against the live environment. Nothing in it is inferred.
 
-### 14.2 Version History
+### 13.2 Version History
 
 | Version | Date | Author | Change |
 |---|---|---|---|
