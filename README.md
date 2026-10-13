@@ -5,3 +5,6 @@ https://coredgeio.atlassian.net/wiki/spaces/~71202091d26fef5488435ead9992c64b80c
 
 # Archietecture diagram present in this repo in file:
 arch-diag-links
+
+# Terraform architecture document:
+TERRAFORM-ARCHITECTURE.md
