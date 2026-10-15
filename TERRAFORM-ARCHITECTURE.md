@@ -116,7 +116,21 @@ outside the VNet space and is **immutable** after cluster creation
 ### 2.2 Resource Inventory
 
 72 `resource` blocks, 2 `data` sources, 1 `output`, 22 variables. With `for_each`
-expansion these become **89 addresses in state** (`terraform state list`).
+expansion these become **89 addresses in state** (`terraform state list`), which
+reconciles as:
+
+| | Count |
+|---|---|
+| `resource` blocks as written | 72 |
+| `azurerm_eventhub.this` — `for_each` over 7 event hubs | +6 |
+| `azurerm_subnet.this` — `for_each` over 6 subnets | +5 |
+| `azurerm_postgresql_flexible_server_database.pg_db` — `for_each` over 5 databases | +4 |
+| **Managed resources in Azure** | **87** |
+| `data` sources, which `terraform state list` also prints | +2 |
+| **Total state entries** | **89** |
+
+The distinction matters when reading the figure elsewhere: 87 things exist in
+Azure; the other two are data reads re-evaluated on every plan.
 
 | Service | Resource | Key configuration |
 |---|---|---|
@@ -228,7 +242,7 @@ The `backend` block is inside `providers.tf`. Overwriting that file with a copy
 that lacks the block — for example by `scp`-ing from a workstation checkout where
 it was removed — makes Terraform fall back to local state. The next
 `terraform init` then demands `-reconfigure` or `-migrate-state`, and a wrong
-answer there puts all 89 live resources at risk of being treated as new.
+answer there puts all 87 live resources at risk of being treated as new.
 
 **Rule: `providers.tf` is never copied over the jumphost's copy without checking
 the backend block survived.**
@@ -249,7 +263,7 @@ creating the account by hand first. **This has never been tested** (§12.6).
 
 | Provider | Constraint | Why |
 |---|---|---|
-| `hashicorp/azurerm` | `~> 3.0` | 89 live resources are planned against 3.x |
+| `hashicorp/azurerm` | `~> 3.0` | 87 live resources are planned against 3.x |
 | `Azure/azapi` | `~> 2.0` | Azure Managed Redis (§5.1) |
 | `hashicorp/random` | `~> 3.0` | PostgreSQL admin password |
 | `hashicorp/time` | `~> 0.11` | two propagation waits (§5.2) |
@@ -260,7 +274,7 @@ reproducible across machines.
 ### 5.1 Why Redis Uses `azapi`, Not `azurerm`
 
 `azurerm_managed_redis` exists **only in azurerm v4.x**. Upgrading the provider
-for one resource would have put 89 unrelated resources through v4's breaking
+for one resource would have put 87 unrelated resources through v4's breaking
 changes, so Redis is declared through `azapi`, which calls the ARM REST API
 directly and is version-independent (see the header comment in `redis.tf`).
 
@@ -1094,7 +1108,7 @@ has been.
 | Check | Result | When |
 |---|---|---|
 | `terraform plan` against unchanged config | **No changes. Your infrastructure matches the configuration.** | 12 Oct 2026 |
-| `terraform state list` | 89 resources | 12 Oct 2026 |
+| `terraform state list` | 89 entries — 87 managed + 2 data | 12 Oct 2026 |
 | HCL parse, all 21 files incl. both `.disabled` | Pass | 13 Oct 2026 |
 | Declared vs live spot-checks (11) | All matched — PG SKU and HA mode, AKS version and private flag, ACR tier and public access, Key Vault RBAC and private access, Redis `NoCluster` and SKU, VNet space, 8 subnets, 7 event hubs | 12 Oct 2026 |
 | Secret / key / state scan of the repository | Clean | 12 Oct 2026 |
@@ -1107,4 +1121,4 @@ command run against the live environment. Nothing in it is inferred.
 
 | Version | Date | Author | Change |
 |---|---|---|---|
-| 1.0 | 13 Oct 2026 | Sidhant Khanna | First issue. Covers `main` at `417dc58`, 24 files on origin, 89 resources in state. |
+| 1.0 | 13 Oct 2026 | Sidhant Khanna | First issue. Covers `main` at `417dc58`, 24 files on origin, 89 entries in state. |
