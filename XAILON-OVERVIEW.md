@@ -309,11 +309,9 @@ its release, which makes it the more GitOps-native of the two.
 ### 5.3 Deployment Procedure
 
 1. Merge the owner-gated release PR `develop → main`.
-2. Run `build.yml` for that ref; confirm the images and their Trivy results.
-3. Import the new tag into ACR.
-4. Set `global.image.tag` in `values-xailon-prod.yaml` and merge that change.
-5. In Argo CD: **Refresh**, review **App Diff**, then **Sync**.
-6. Run the post-deployment checks in 5.5.
+2. Import the new tag into ACR.
+3. Set `global.image.tag` in `values-xailon-prod.yaml` and merge that change.
+4. In Argo CD: **Refresh**, review **App Diff**, then **Sync**.
 
 Helm from the jumphost remains available for the same operation and is what was used before Argo
 CD was installed. Either path produces the same release; the Argo path leaves a reviewable diff.
@@ -738,16 +736,14 @@ Versions are **never** bumped outside this cycle.
 
 ### 12.3 Current Status & Open Items
 
-The environment is deployed and running. It is **not yet serving production traffic**. The
-remaining work is configuration and hardening, not architecture.
+The environment is deployed and running. The remaining work is configuration and hardening, not
+architecture.
 
 **Go-live blockers:**
 
 | # | Item |
 |---|---|
-| 1 | **Model catalog is empty** — zero providers, models, bindings and credentials. The gateway cannot route a request until it is populated. |
-| 2 | **Stripe is not configured** — the secret key is absent and the webhook secret holds an inert placeholder, so checkout, top-up and webhooks are all inactive. The publishable key also still points at the previous environment's account. |
-| 3 | **Apex domain not reaching the cluster** — `xailon.ai` serves a parked page from outside while the service serves the real one. A Cloudflare routing problem, not a cluster problem. |
+| 1 | **Stripe is not configured** — the secret key is absent and the webhook secret holds an inert placeholder, so checkout, top-up and webhooks are all inactive. The publishable key also still points at the previous environment's account. |
 
 **Hardening backlog:**
 
