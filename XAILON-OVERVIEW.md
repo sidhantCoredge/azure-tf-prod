@@ -130,6 +130,45 @@ The equivalents on TokenFactory are bundled or in-cluster (PostgreSQL, Redis, Ka
 Vault, MetalLB). The application is indifferent: every one of these is selected by values in the
 environment overlay, not by a code change.
 
+### 2.4 Which Service Uses Which Managed Service
+
+Derived from the chart — the datastore wiring in each service's templates and the per-service
+secret-key map in `CONFIGURATION.md`. "Secrets" means the service reads at least one key from
+`tokenfactory-secrets`, and therefore depends on Key Vault.
+
+| Service | PostgreSQL | Redis | Secrets | Keycloak | OpenFGA | Also |
+|---|:-:|:-:|:-:|:-:|:-:|---|
+| `envoy` | — | — | — | — | — | — |
+| `tf-warden` | ✅ | ✅ | ✅ | — | — | key cache + rate-limit buckets in Redis |
+| `tf-relay` | ✅ | ✅ | ✅ | — | — | Redis for the metering stream; PostgreSQL for the durable video-job store (ADR-0006) |
+| `tf-shim` | — | ✅ | — | — | — | own `TF_SHIM_REDIS_*` env, not the shared datastore block; reads the model map from a Redis hash |
+| `tf-babel` | — | — | — | — | — | stateless dialect proxy |
+| `tf-auth` | ✅ | ✅ | ✅ | ✅ | ✅ | SMTP; Redis host set explicitly in the overlay (see Control-Plane Deviations) |
+| `tf-accounts` | ✅ | ✅ | ✅ | ✅ | — | SMTP, Stripe |
+| `tf-control` | ✅ | — | ✅ | — | — | Kubernetes API, to reconcile the gateway resources |
+| `tf-ledger` | ✅ | ✅ | ✅ | — | — | MinIO for exports, OpenMeter, Stripe webhook |
+| `tf-ops` | — | — | ✅ | — | — | Kubernetes API, read-only |
+| `tf-admin-web` | — | — | ✅ | — | — | `admin-api-key` only |
+| `tf-portal-web` | — | — | — | — | — | nginx serving static assets |
+| `tf-site-web`, `tf-docs-web` | — | — | — | — | — | public site and docs |
+| `keycloak` | ✅ | — | ✅ | — | — | its own `keycloak` database |
+| `openfga` | — | — | ✅ | — | — | runs with an **in-memory** datastore; its database exists but is unused |
+| `minio` | — | — | ✅ | — | — | S3 access keys |
+| `akv-secret-syncer` | — | — | ✅ | — | — | holds the Key Vault CSI mount open; creates no application state |
+| OpenMeter (own namespace) | ✅ | ✅ | — | — | — | `openmeter` and `svix` databases; **Event Hubs**; ClickHouse; its own bundled Redis for Svix only |
+
+**Every** workload pulls its image from ACR, so ACR is omitted as a column.
+
+Three consequences worth drawing out:
+
+- **PostgreSQL is the widest dependency.** Seven `tf-*` services plus Keycloak and OpenMeter
+  connect to it, so a Flexible Server failover is felt almost everywhere.
+- **Redis is narrower but sits on the hot path.** `tf-warden` cannot authorize without it and
+  `tf-relay` cannot emit usage, so a Redis outage stops traffic even though no durable data is lost.
+- **Key Vault is a start-up dependency, not a run-time one.** Values are read from
+  `tokenfactory-secrets` at container start, so a vault outage does not affect running pods — but
+  any pod that restarts during one will fail.
+
 ---
 
 ## 3. Development
