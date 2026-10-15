@@ -239,9 +239,9 @@ az acr import → acrtokenfactory.azurecr.io/infinia-technology/ai-gateway-platf
 
 `az acr import` runs **server-side**: ACR pulls from the source registry itself. Nothing passes
 through an operator's machine, no Docker daemon is required, digests are preserved, and the Azure
-Firewall is not in the path — so sources that are blocked from inside the VNet still import. A
-script on the jumphost performs the import for all 13 service images plus the infrastructure
-images, skipping anything already present.
+Firewall is not in the path — so sources that are blocked from inside the VNet still import. `scripts/acr-import-images.sh` in the infrastructure repository performs the import for all 13
+service images plus the dependency images, skipping anything already present. See Operational
+Scripts.
 
 The tag currently deployed is `0.16.2-e1bd218`.
 
@@ -414,8 +414,9 @@ Three operational properties:
 3. **Rotation refreshes the Secret, not the pods.** A 2-minute reconciler updates the Secret on its
    own; environment variables are read once at process start, so consumers still need a restart.
 
-The manifest exists only on the jumphost and is not version-controlled — the largest single-copy
-risk in the environment.
+The manifest is being moved into the infrastructure repository's `scripts/` folder. Until that
+lands it exists only on the jumphost, which makes it the largest single-copy risk in the
+environment.
 
 ### 6.4 Storage
 
@@ -442,20 +443,97 @@ persistence and is rebuildable from PostgreSQL plus traffic.
 
 ## 7. Infrastructure
 
-The Azure infrastructure is Terraform in `azure-infra-terraform`, and is documented separately.
-What matters to the application lifecycle:
+### 7.1 Where the Code Lives
 
-- **It is code, and it is reviewed.** `main` has branch protection; changes go through a PR.
-- **There is no infrastructure CI.** `terraform plan` needs VNet-internal execution, so a hosted
-  runner cannot run it. Plans and applies are performed by hand from the jumphost, and every apply
-  is followed by a plan that must report no changes.
-- **Roughly eight to ten post-apply steps are manual** — Key Vault seeding, the SecretProviderClass
-  and syncer, PostgreSQL roles and schema ownership, ACR imports, the ingress controller, the
-  tunnel, OpenMeter, the TLS secret, and the Cloudflare configuration. Scripts exist for these and
-  are published to a separate repository; the Cloudflare side exists only in the dashboard.
-- **Some settings cannot be reverted** by reverting the code — Key Vault purge protection, the
-  PostgreSQL HA mode and storage size among them. These are called out in the infrastructure
-  document and must be flagged in any PR that touches them.
+| Repository | Contents |
+|---|---|
+| **https://github.com/Infinia-Technology/azure-infra-terraform** | The Azure infrastructure as Terraform — resource group, VNet and subnets, AKS, Azure Firewall and the egress allow-list, PostgreSQL, Redis, Key Vault, ACR, Event Hubs, storage, private DNS, VPN, Bastion and the jumphost. Also the home of the operational scripts (see below). |
+| **https://github.com/Infinia-Technology/ai-gateway-platform** | The application, the Helm umbrella chart and the Xailon overlay. |
+
+Branch protection is on for `main` in both repositories; every change goes through a pull request.
+
+**There is no infrastructure CI.** `terraform plan` requires execution from inside the VNet, so a
+hosted runner cannot run it. Plans and applies are performed by hand from the jumphost, and every
+apply is followed by a plan that must report no changes.
+
+**Some settings cannot be reverted** by reverting the code — Key Vault purge protection, the
+PostgreSQL HA mode and the storage size among them. Any pull request touching one must say so.
+
+### 7.2 Operational Scripts
+
+Roughly eight to ten post-apply steps are not performed by Terraform or Helm: Key Vault seeding,
+the SecretProviderClass and its syncer, PostgreSQL roles and `public` schema ownership, the ACR
+image import, the ingress controller, the Cloudflare tunnel, OpenMeter, the TLS secret, and the
+Cloudflare DNS and tunnel configuration.
+
+Scripts exist for all of these. Their home is:
+
+```
+https://github.com/Infinia-Technology/azure-infra-terraform  →  scripts/
+```
+
+> **Status:** the scripts currently live at `~/xalion` on the jumphost and are being moved into
+> that `scripts/` folder. Until that push lands, the jumphost copy is the working one. Treat the
+> repository path as the location to pull from once it is populated.
+
+They run **from the jumphost**, because Key Vault, PostgreSQL, ACR and the AKS API server are all
+private-endpoint only and unreachable from anywhere else.
+
+| To do this | Run |
+|---|---|
+| Import images from GHCR into ACR | `scripts/acr-import-images.sh` — `TAG=<tag> ./acr-import-images.sh --check` first, then without `--check`; `--infra` for the dependency images, `--all` for both |
+| Seed Key Vault | `scripts/kv-seed-secrets.sh` |
+| Build or repair `tokenfactory-secrets` | `scripts/deploy-secrets.sh` — `--check` reports, `--partial` builds from only the keys that exist |
+| Create or re-sync PostgreSQL roles | `scripts/pg-create-roles.sh` — `--check` first |
+| Unstick a dirty migration | `scripts/fix-tf-migrations.sh` (tokenfactory) or `scripts/fix-openmeter-migration.sh` |
+| See the real migration error | `scripts/catch-migration-error.sh` |
+| Deploy or re-deploy OpenMeter | `scripts/deploy-openmeter-azure.sh` — `--check`, or `DRY_RUN=1` |
+| Create the Argo CD Application | `scripts/argocd-create-xailon-app.sh` |
+| Uninstall both releases in the right order | `scripts/uninstall-all.sh` |
+
+Most accept `--check`, which reports state and changes nothing. Use it first. A one-line reference
+for every script is in `scripts/SCRIPTS.txt`.
+
+The Cloudflare side has no script — hostname-to-service routing lives in the Zero Trust dashboard
+and is not version-controlled anywhere.
+
+### 7.3 Connecting to the Azure Services
+
+Everything below runs **from the jumphost**. Reach the jumphost over the Point-to-Site VPN, or
+through Azure Bastion:
+
+```bash
+az network bastion ssh -n bas-tokenfactory -g rg-tokenfactory \
+  --target-resource-id $(az vm show -g rg-tokenfactory -n vm-jumphost-tokenfactory --query id -o tsv) \
+  --auth-type AAD
+```
+
+Then, once on the jumphost:
+
+| Service | Command |
+|---|---|
+| **Azure CLI** | `az login` then `az account set --subscription <id>` |
+| **AKS** | `az aks get-credentials -g rg-tokenfactory -n aks-tokenfactory` then `kubectl -n xailon-tf-prod get pods` |
+| **Key Vault** | `az keyvault secret list --vault-name kv-tokenfactory -o table` |
+| **Key Vault — one value** | `az keyvault secret show --vault-name kv-tokenfactory -n <name> --query value -o tsv` |
+| **PostgreSQL — application role** | `PGPASSWORD=$(az keyvault secret show --vault-name kv-tokenfactory -n db-password --query value -o tsv) psql -h psql-tokenfactory.postgres.database.azure.com -U tokenfactory -d tokenfactory --set=sslmode=require` |
+| **PostgreSQL — admin** | same, with `-n pg-admin-password` and `-U pgadmintf -d postgres` |
+| **Redis** | `redis-cli -h redis-tokenfactory.uaenorth.redis.azure.net -p 10000 -a $(az keyvault secret show --vault-name kv-tokenfactory -n redis-password --query value -o tsv) PING` |
+| **ACR — list** | `az acr repository list -n acrtokenfactory -o table` |
+| **ACR — tags for one image** | `az acr repository show-tags -n acrtokenfactory --repository infinia-technology/ai-gateway-platform/tf-auth -o table` |
+| **Event Hubs** | `az eventhubs eventhub list -g rg-tokenfactory --namespace-name ehns-tokenfactory -o table` |
+
+Four things to know before using these:
+
+- **Port 10000 for Redis, not 6379**, and **no `--tls`**: Azure Managed Redis is configured
+  `Plaintext` here because the application has no TLS client path.
+- **`sslmode=require` is mandatory** for PostgreSQL on Flexible Server.
+- **Verify DNS with `getent hosts`, not `dig`.** `dig` bypasses the OS resolver order and can
+  report success while the application path fails. Every one of these hostnames must resolve to a
+  private address; a public address means the private DNS zone or the resolver is wrong.
+- **Do not use `az aks get-credentials --admin`.** That is the cluster-local admin credential,
+  which bypasses every role assignment. Use the plain form so access is governed by your own
+  identity.
 
 ---
 
@@ -602,7 +680,8 @@ pod exits on sight of it, and the real error is never logged.
 **Clearing the dirty flag is the wrong recovery.** It makes the tool treat the migration as applied
 without running it, silently skipping schema — which is how twelve migrations were skipped once and
 tables that should have existed did not. The correct recovery is to force the version back by one
-and re-run. Scripts on the jumphost serialise this safely.
+and re-run. `scripts/fix-tf-migrations.sh` serialises this safely; `scripts/catch-migration-error.sh`
+recovers the error the dirty flag is hiding.
 
 ### 11.3 Backup & Restore
 
@@ -675,7 +754,7 @@ remaining work is configuration and hardening, not architecture.
 | Item | Why it matters |
 |---|---|
 | Enable the admin audit log category | No record of secret access today |
-| Version-control the SecretProviderClass and the post-apply scripts | Single copies on one machine |
+| Finish moving the SecretProviderClass and the post-apply scripts into the infrastructure repository | Single copies on one machine until then |
 | Fix the `tf-auth` Redis host defect in the subchart | Removes an overlay workaround |
 | Add leader election to `tf-ledger` | Unblocks replicas above one |
 | Move OpenFGA onto its database | Authorization state does not survive a restart |
