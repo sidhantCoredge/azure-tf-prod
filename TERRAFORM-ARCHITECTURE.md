@@ -9,13 +9,6 @@
 | **Version** | 1.1 |
 | **Last updated** | 15 October 2026 |
 
-> This document describes the Terraform configuration that provisions the Xailon
-> TokenFactory Azure environment. It mirrors the repository's actual state at the
-> commit named in §12.6 and does not describe unimplemented tooling as if it
-> existed. Where a step is manual, undocumented elsewhere, or untested, it is
-> labelled as such. Items marked *Recommended* are proposals, not implemented
-> controls.
-
 ---
 
 ## 1. Introduction
@@ -32,25 +25,21 @@ identity plumbing and egress control. It stops at the cluster boundary.
 - AKS cluster (private) and both node pools
 - Azure Firewall + policy + the full egress allow-list
 - Azure Database for PostgreSQL Flexible Server and its five databases
-- Azure Managed Redis (via `azapi`)
+- Azure Managed Redis
 - Azure Container Registry, Key Vault, Event Hubs, two storage accounts
 - DNS Private Resolver, private DNS zones, private endpoints
 - Point-to-Site VPN gateway, Azure Bastion, jumphost VM
-- Two Key Vault secrets (`pg-admin-password`, `redis-password`)
+- Two Key Vault secrets
 
 **Out of scope (not in this repository):**
 
 - **Everything inside Kubernetes.** The application is deployed by Helm from
   `Infinia-Technology/ai-gateway-platform` (`helm/tokenfactory`, overlay
   `values-xailon-prod.yaml`). No Kubernetes resource is managed here.
-- **The ~8–10 manual post-apply steps.** These are scripted, but the scripts
-  are **not yet version-controlled** (§9.5).
 - **Cloudflare configuration** — tunnel, DNS records, Origin certificate.
 - **Entra ID role assignments for human operators.** Deliberately excluded:
   each person arrives with their own identity and gets exactly what their own
-  Azure RBAC grants (see `jumphost.tf`).
-- **Two private keys** — one for the VPN root certificate, one for the
-  Cloudflare Origin certificate. Both are held outside this repository.
+  Azure RBAC grants.
 
 On Azure the infrastructure is code, and this repository is that code.
 
@@ -65,8 +54,8 @@ are spelled out in §8.4.
    ingress into the VNet at all — inbound traffic arrives through a Cloudflare
    Tunnel initiated *outbound* from a pod.
 2. **All egress through the firewall.** AKS, management and PostgreSQL subnets
-   route `0.0.0.0/0` to the Azure Firewall private IP
-   (`route_table.tf`). Nothing leaves the VNet without matching an
+   route `0.0.0.0/0` to the Azure Firewall private IP.
+   Nothing leaves the VNet without matching an
    explicit rule. A missed FQDN fails as an application-level timeout, not as a
    visible network error.
 3. **Deny-by-default inside the VNet too.** Every NSG ends with
@@ -81,14 +70,13 @@ are spelled out in §8.4.
 
 The lifecycle is: **write → validate → plan → apply → verify → operate**.
 Changes are authored as HCL in this repository and reviewed through a pull
-request (§3.3). They are then planned and applied **by hand from the jumphost**
-(§5.1) — there is no pipeline and no automated apply. Every apply is followed by
-a plan that must report no changes (§5.2). Environments do not promote: there is
-a single production environment (§5.4).
+request. They are then planned and applied **by hand from the jumphost** — there is no pipeline and no automated apply. Every apply is followed by
+a plan that must report no changes. Environments do not promote: there is
+a single production environment.
 
-This document is organised around that lifecycle: §2 the architecture; §3–§5 how
-a change is made, checked and deployed; §6–§8 what is deployed, how it is built
-and how it is secured; §9–§12 how it is run, maintained, recovered and released.
+This document is organised around that lifecycle: the architecture, how
+a change is made, checked and deployed, what is deployed, how it is built
+and how it is secured, and how it is run, maintained, recovered and released.
 It is written for **operators who will modify the environment**, and for
 security and management reviewers.
 
@@ -125,14 +113,10 @@ security and management reviewers.
                      ehns-tokenfactory
 ```
 
-`10.40.5.0/24` – `10.40.7.0/24` are unallocated. `10.244.0.0/16` is deliberately
-outside the VNet space and is **immutable** after cluster creation
-(`aks.tf`).
-
 ### 2.2 Resource Inventory
 
 72 `resource` blocks, 2 `data` sources, 1 `output`, 22 variables. With `for_each`
-expansion these become **89 addresses in state** (`terraform state list`), which
+expansion these become **89 addresses in state**, which
 reconciles as:
 
 | | Count |
@@ -254,7 +238,7 @@ out — presenting as "the internet dies the moment I connect to the VPN".
 The resolver's IP is **static by design**. A dynamic one would force
 `azurerm_virtual_network.dns_servers` to reference the resolver's output, creating
 a `vnet → subnet → resolver → inbound → vnet` cycle. Both sides reading the same
-variable breaks the cycle (`dns_resolver.tf`).
+variable breaks the cycle.
 
 ### 2.8 Egress Allow-List
 
@@ -395,31 +379,21 @@ a pull request. Direct pushes to `main` are rejected.
 
 There is **no build step and no CI pipeline** for this repository. Terraform is
 interpreted; the nearest thing to a build artefact is the saved plan
-(`tf.plan`) produced on the jumphost and applied unchanged (§5.2).
+produced on the jumphost and applied unchanged.
 
-This is a gap, not an omission. `terraform plan` needs VNet-internal execution
-(§5.1), so a hosted runner cannot run it. Static checks (formatting, linting,
+This is a gap, not an omission. `terraform plan` needs VNet-internal execution,
+so a hosted runner cannot run it. Static checks (formatting, linting,
 secret scanning) do not need network access and could run on every pull request.
 
 ### 4.2 Validation & Testing
 
 Checks performed today are manual:
 
-- `terraform plan` against the unchanged configuration must print **No changes**
-  (§5.2, §12.4).
-- HCL parse of all 21 files, including both `.disabled` files (§12.5).
-- Spot-checks of declared versus live attributes (§12.5).
+- `terraform plan` against the unchanged configuration must print **No changes**.
+- HCL parse of all 21 files, including both `.disabled` files.
+- Spot-checks of declared versus live attributes.
 
-There are no automated tests (for example Terratest). Remember that a clean plan
-means *well-formed*, not *accepted by ARM* (§7.3.1).
-
-### 4.3 Code Quality
-
-No formatter or linter is enforced. **Recommended:** `terraform fmt -check` and
-`terraform validate` as required pull-request checks, plus `tflint` with the
-azurerm ruleset. None of them needs VNet access.
-
-### 4.4 Security & Vulnerability Scanning
+### 4.3 Security & Vulnerability Scanning
 
 Audited 12 October 2026, clean on all counts: no hardcoded secrets, no private
 keys, no state files, no backups or binaries. `.gitignore` covers `.terraform/`,
@@ -435,7 +409,7 @@ No automated scanner runs against the repository. **Recommended:** secret
 scanning on push, and a policy scanner (`checkov` or `trivy config`) on pull
 requests, which would also catch a public-access regression.
 
-### 4.5 Provider Supply Chain
+### 4.4 Provider Supply Chain
 
 `.terraform.lock.hcl` is committed, so provider versions and checksums are
 identical on every machine (§7.3). No container images are built from this
@@ -853,7 +827,7 @@ version 2025-04-01`. Moving the cluster itself to `2025-07-01` is not free:
 older API version. The consequence is that the portal shows **Public network
 access = "Not set"** rather than "Disabled" — every other private resource here
 sets it explicitly. Traffic still reaches Redis through the private endpoint,
-but "not set" is not the same guarantee as "disabled" (§10.3, §12.3).
+but "not set" is not the same guarantee as "disabled" (§10.3).
 
 #### 7.3.2 The Two Deliberate Waits
 
@@ -1101,7 +1075,7 @@ For a deployment day, enabling logging first is strongly recommended.
 |---|---|---|
 | Configuration matches live | `terraform plan` on the jumphost | `No changes. Your infrastructure matches the configuration.` |
 | Private DNS | `getent hosts kv-tokenfactory.vault.azure.net` (§5.3) | `10.40.3.x` |
-| State inventory | `terraform state list` (count the lines) | 89 entries today (§12.5) |
+| State inventory | `terraform state list` (count the lines) | 89 entries today (§12.4) |
 | Secret reached the cluster | byte count of the key in `tokenfactory-secrets` (§9.4) | non-zero |
 
 ### 9.4 Daily Operations: Adding or Rotating a Secret
@@ -1375,8 +1349,8 @@ See §5.5. Irreversible settings are listed in §8.4.
 A "release" of this infrastructure is a commit on `main` that has been applied.
 There are no version tags or release branches. The flow is: branch → pull request
 → review of the `plan` → merge → `git pull` on the jumphost → `plan` → `apply`
-→ post-apply validation (§12.4). The commit that was verified is recorded in the
-version history (§12.6).
+→ post-apply validation (§12.3). The commit that was verified is recorded in the
+version history (§12.5).
 
 ### 12.2 Change Management
 
@@ -1391,37 +1365,18 @@ version history (§12.6).
 - A `destroy and then create replacement` line in a plan on a stateful resource
   is a **stop**, not a warning (§6.2).
 
-### 12.3 Production Readiness Checklist
-
-| Area | Status | Reference |
-|---|---|---|
-| Private by default, no public ingress | ✅ | §8.3 |
-| Egress allow-listed through the firewall | ✅ | §2.8 |
-| Remote, versioned state | ✅ | §7.2 |
-| Branch protection on `main` | ✅ | §3.3 |
-| Zone-redundant data tier (PostgreSQL, Redis) | ✅ | §6.1, §6.2 |
-| No secrets or keys in the repository | ✅ | §4.4 |
-| Redis public network access explicitly disabled | ⚠️ "Not set" | §7.3.1 |
-| Redis API version before the 31 Oct 2026 retirement | ⚠️ cluster on `2025-04-01` | §10.3 |
-| Monitoring and alerting | ⚠️ disabled | §9.1 |
-| State locking beyond the blob lease | ⚠️ convention only | §7.2 |
-| CI checks on pull requests | ❌ none | §4.1 |
-| Post-apply scripts under version control | ❌ | §9.5 |
-| Rebuild tested | ❌ never | §11.5 |
-| RTO / RPO defined | ❌ | §11.5 |
-
-### 12.4 Post-Apply Validation
+### 12.3 Post-Apply Validation
 
 1. `terraform plan` prints **No changes. Your infrastructure matches the
    configuration.**
 2. `getent hosts` for Key Vault and PostgreSQL returns `10.40.3.x` addresses
    (§5.3).
-3. `terraform state list` count matches the figure in §12.5; record any change.
+3. `terraform state list` count matches the figure in §12.4; record any change.
 4. If a secret changed, confirm it reached `tokenfactory-secrets` and restart
    its consumers (§9.4).
-5. Update the version history (§12.6).
+5. Update the version history (§12.5).
 
-### 12.5 Accuracy Verification
+### 12.4 Accuracy Verification
 
 | Check | Result | When |
 |---|---|---|
@@ -1435,9 +1390,9 @@ version history (§12.6).
 Every figure in this document comes from the configuration files or from a
 command run against the live environment. Nothing in it is inferred.
 
-### 12.6 Version History
+### 12.5 Version History
 
 | Version | Date | Author | Change |
 |---|---|---|---|
 | 1.0 | 13 Oct 2026 | Sidhant Khanna | First issue. Covers `main` at `417dc58`, 24 files on origin, 89 entries in state. |
-| 1.1 | 15 Oct 2026 | Sidhant Khanna | Restructured around the infrastructure lifecycle (Development, Build & CI, Deployment, Security, Monitoring, Maintenance, Troubleshooting & Recovery, Release & Change Management). Added lifecycle, branching, validation, environment promotion, rollback, audit, common issues, backup/DR, readiness checklist and post-apply validation. Documented the split Redis API versions. Existing content moved and renumbered; cross-references updated. |
+| 1.1 | 15 Oct 2026 | Sidhant Khanna | Restructured around the infrastructure lifecycle; added missing sections. |
