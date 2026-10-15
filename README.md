@@ -1,6 +1,6 @@
 # azure-tf-prod
 
-This repo is having terraform archietecture links with the TERRAFORM-ARCHITECTURE.md
+This repo holds the DevOps overview for the Xailon TokenFactory deployment, XAILON-OVERVIEW.md.
 
 # Steps to follow written here:
 https://coredgeio.atlassian.net/wiki/spaces/~71202091d26fef5488435ead9992c64b80c845/pages/1657176085/Azure+TF+prod
@@ -8,5 +8,5 @@ https://coredgeio.atlassian.net/wiki/spaces/~71202091d26fef5488435ead9992c64b80c
 # Archietecture diagram present in this repo in file:
 arch-diag-links
 
-# Terraform architecture document:
-TERRAFORM-ARCHITECTURE.md
+# DevOps overview document:
+XAILON-OVERVIEW.md
