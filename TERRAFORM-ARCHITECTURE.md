@@ -285,16 +285,7 @@ terraform apply tf.plan
 
 A plan against unchanged configuration must print **`No changes. Your infrastructure matches the configuration.`** Investigate any drift before applying anything else.
 
-### 5.3 Verifying DNS Before an Apply
-
-```bash
-getent hosts kv-tokenfactory.vault.azure.net     # expect 10.40.3.x
-getent hosts psql-tokenfactory.postgres.database.azure.com
-```
-
-Use `getent`, not `dig`: `dig` bypasses the OS resolver order and can report success while the application path fails.
-
-### 5.4 Environment Promotion
+### 5.3 Environment Promotion
 
 | Env | Resource group | Deploy model | Notes |
 |---|---|---|---|
@@ -302,7 +293,7 @@ Use `getent`, not `dig`: `dig` bypasses the OS resolver order and can report suc
 
 There is no dev or staging copy, so plan review is the only gate. Globally unique names are hardcoded, so a parallel environment cannot be created without editing them.
 
-### 5.5 Rollback
+### 5.4 Rollback
 
 Terraform has no undo.
 
@@ -556,18 +547,7 @@ terraform plan -out=tf.plan
 | State inventory | `terraform state list` (count the lines) | 89 entries today |
 | Secret reached the cluster | byte count of the key in `tokenfactory-secrets` | non-zero |
 
-### 9.4 Daily Operations: Adding or Rotating a Secret
-
-Adding a secret takes four steps; skipping any of them fails silently. Never edit `tokenfactory-secrets` by hand — it is a derived object and is rewritten from the vault.
-
-1. **Write the value to the vault** from the jumphost: `az keyvault secret set --vault-name kv-tokenfactory --name <secret-name> --file <path>` (a file keeps it out of shell history).
-2. **Declare it in `SecretProviderClass tokenfactory-kv`** in two places: `spec.parameters.objects` (what to fetch) and `spec.secretObjects[].data` (what to write into `tokenfactory-secrets`). Back the manifest up first with `kubectl get secretproviderclass tokenfactory-kv -o yaml`.
-3. **Wait about 2 minutes and confirm** the key reached `tokenfactory-secrets`. If not, one of the two entries in step 2 is missing or misspelled.
-4. **Restart the consumers** with `kubectl rollout restart deploy/<name>`; a running pod keeps its old environment.
-
-Rotating an existing secret skips step 2. For `redis-password` and `pg-admin-password`, rotate from Terraform, not the portal, or the next `apply` overwrites the change. A key in the Secret is still unused unless the chart references it through `global.secrets.*`.
-
-### 9.5 What Terraform Does Not Do
+### 9.4 What Terraform Does Not Do
 
 After `terraform apply` the environment is **not ready**. These steps are manual:
 
@@ -610,14 +590,6 @@ Auto-upgrade is off. Change `kubernetes_version` in `variables.tf` (currently `1
 - Providers are pinned (`azurerm ~> 3.0`, `azapi ~> 2.0`). Upgrade with `terraform init -upgrade` followed by a full plan with no unexpected changes. Moving to azurerm v4 would also replace the two `azapi_resource` Redis blocks.
 - **Action needed — Redis API version.** The Redis cluster is still on `2025-04-01`. Microsoft has announced retirement of Azure Managed Redis API versions older than `2025-07-01` on **31 October 2026**; confirm the notice and plan the cluster's move before then. The `publicNetworkAccess` constraint makes this a planned change, not a version bump.
 
-### 10.4 Certificate Renewal
-
-The VPN root certificate (public half in `p2s_root_cert_data`) and the Cloudflare Origin certificate (applied by hand as a TLS secret) are managed outside this repository.
-
-### 10.5 Capacity Management
-
-Capacity changes are variable edits (see Scaling). Redis is larger than the application's 3 GB cap needs; PostgreSQL storage only grows and its IOPS scale with it.
-
 ---
 
 ## 11. Troubleshooting & Recovery
@@ -629,7 +601,7 @@ Capacity changes are variable edits (see Scaling). Redis is larger than the appl
 | `ForbiddenByConnection` / 403 on Key Vault or blob | Run from outside the VNet | Run on the jumphost |
 | Name resolves wrongly, or `dig` disagrees with the app | `dig` bypasses the OS resolver order | Use `getent` |
 | Application times out calling an external service | FQDN missing from the firewall allow-list | Add a rule; enable logging to see the deny |
-| Secret is in the vault but the pod does not see it | SecretProviderClass missing a half, or pods not restarted | See Adding or Rotating a Secret |
+| Secret is in the vault but the pod does not see it | SecretProviderClass missing a half, or pods not restarted | Declare it in both SecretProviderClass blocks, then restart the consumers |
 | Every plan shows `upgrade_settings` removal or a `true → false` VM agent drift | Drift-suppression setting removed | Restore it |
 | `terraform init` demands `-reconfigure` or `-migrate-state` | Backend block lost from `providers.tf` | Restore the block in `providers.tf` |
 | Redis apply: `NoCluster … not supported in API version 2025-04-01` | Database on the older API version | Database uses `2025-07-01` |
@@ -640,7 +612,7 @@ Capacity changes are variable edits (see Scaling). Redis is larger than the appl
 
 ### 11.2 Operational Runbooks
 
-Procedures live in this document: Standard Change Workflow, Verifying DNS Before an Apply, Adding or Rotating a Secret, Scaling, Kubernetes Upgrades, Re-enabling Observability, and Redis — Why NoCluster (clustering-policy change). The post-apply scripts are not version-controlled, so they are not runbooks yet.
+Procedures live in this document: Standard Change Workflow, Scaling, Kubernetes Upgrades, Re-enabling Observability, and Redis — Why NoCluster (clustering-policy change). The post-apply scripts are not version-controlled, so they are not runbooks yet.
 
 ### 11.3 Incident Management
 
