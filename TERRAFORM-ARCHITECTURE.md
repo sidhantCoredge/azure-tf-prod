@@ -219,17 +219,13 @@ VPN client → `vnet.dns_servers = 10.40.4.4` → resolver inbound endpoint → 
 
 Also committed: `.gitignore`, `.terraform.lock.hcl` and `tokenfactory-terraform-file-reference.xlsx`.
 
-### 3.2 Comment Style
-
-Comments are **decision records, written in English**: what was tried, what Azure returned, and why the current form is the answer. `redis.tf` is the clearest example.
-
-### 3.3 Git / Branching Strategy
+### 3.2 Git / Branching Strategy
 
 - **Branch protection is on** for `main`: changes go through a pull request and direct pushes are rejected.
 - The jumphost is a checkout of `main` (`git pull`); nothing is edited there.
 - Reviewer count, commit-message convention and release tagging are not defined.
 
-### 3.4 Coding & Configuration Standards
+### 3.3 Coding & Configuration Standards
 
 - One file per service; flat layout, no modules.
 - Variables live in `variables.tf`; `terraform.tfvars` holds only a public certificate.
@@ -616,7 +612,7 @@ Auto-upgrade is off. Change `kubernetes_version` in `variables.tf` (currently `1
 
 ### 10.4 Certificate Renewal
 
-The VPN root certificate (public half in `p2s_root_cert_data`) and the Cloudflare Origin certificate (applied by hand as a TLS secret) are managed outside this repository. Their expiry dates are not recorded and nothing alerts before they lapse; record both here.
+The VPN root certificate (public half in `p2s_root_cert_data`) and the Cloudflare Origin certificate (applied by hand as a TLS secret) are managed outside this repository.
 
 ### 10.5 Capacity Management
 
