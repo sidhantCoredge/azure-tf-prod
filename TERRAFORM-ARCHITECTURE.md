@@ -43,7 +43,7 @@ identity plumbing and egress control. It stops at the cluster boundary.
   `Infinia-Technology/ai-gateway-platform` (`helm/tokenfactory`, overlay
   `values-xailon-prod.yaml`). No Kubernetes resource is managed here.
 - **The ~8–10 manual post-apply steps.** These are scripted, but the scripts
-  are **not yet version-controlled** (§12.4).
+  are **not yet version-controlled** (§12.5).
 - **Cloudflare configuration** — tunnel, DNS records, Origin certificate.
 - **Entra ID role assignments for human operators.** Deliberately excluded:
   each person arrives with their own identity and gets exactly what their own
@@ -241,7 +241,7 @@ created locally, then migrated) but it means a **clean rebuild cannot start from
 `terraform init`**: the backend it points at does not exist yet.
 
 A rebuild requires either bootstrapping with local state and migrating, or
-creating the account by hand first. **This has never been tested** (§12.5).
+creating the account by hand first. **This has never been tested** (§12.6).
 
 ---
 
@@ -645,7 +645,7 @@ Premium, `admin_enabled = false`, public access off. AKS pulls through
 image pull secret is needed for ACR images.
 
 Images are imported by a script on the jumphost, which is not version-controlled
-(§12.4).
+(§12.5).
 
 ### 8.6 Key Vault
 
@@ -665,7 +665,7 @@ It is `Secrets User` rather than an access policy precisely because the vault is
 in RBAC mode. Secret rotation is enabled on the addon with a 2-minute interval.
 
 Terraform manages exactly **two** secrets. Everything else in the vault is seeded
-outside Terraform (§12.4).
+outside Terraform (§12.5).
 
 ---
 
@@ -755,9 +755,98 @@ Azure resource; the extension uses it purely as a device identity.
 | `redis-password` | Read from ARM `listKeys` → Key Vault (and in state) |
 | Everything else | Seeded outside Terraform |
 
-Secrets reach pods through the **AKS Key Vault Secrets Provider (CSI driver)**,
-which syncs into the `tokenfactory-secrets` Kubernetes Secret. Rotation on the
-addon is enabled at a 2-minute interval.
+Secrets reach pods through the **AKS Key Vault Secrets Provider (CSI driver)**.
+The vault is the source of truth; the Kubernetes Secret is a derived copy.
+
+```
+  Terraform apply            operator, az CLI
+  (2 secrets)                (everything else)
+        │                           │
+        └─────────────┬─────────────┘
+                      ▼
+          ┌───────────────────────────┐
+          │   kv-tokenfactory         │   source of truth
+          │   Azure Key Vault, RBAC   │   private endpoint 10.40.3.6
+          └───────────┬───────────────┘
+                      │  addon identity holds Key Vault Secrets User
+                      ▼
+          ┌───────────────────────────┐
+          │ SecretProviderClass       │   declares WHICH secrets to fetch
+          │ tokenfactory-kv           │     objects:       what to read
+          │                           │     secretObjects: what to write
+          └───────────┬───────────────┘
+                      │  mounted by Deployment/akv-secret-syncer
+                      │  written by the rotation reconciler, ~2 min
+                      ▼
+          ┌───────────────────────────┐
+          │ Secret/tokenfactory-      │   derived copy, lives in etcd
+          │   secrets (xailon-tf-prod)│   owned by the syncer's ReplicaSet
+          └───────────┬───────────────┘
+                      │  secretKeyRef
+                      ▼
+          ┌───────────────────────────┐
+          │ tf-* containers           │   environment variables
+          └───────────────────────────┘
+```
+
+**Why a Kubernetes Secret has to exist at all.** The services read their
+credentials from environment variables, and `secretKeyRef` is the only way to
+populate those — it can point at a Secret and nothing else. A pod cannot read
+Key Vault directly. So the CSI driver's `secretObjects` feature writes a real
+Secret, and the chart is pointed at it by
+`global.secrets.existingSecret: "tokenfactory-secrets"`. The alternative the
+driver offers — a mount-only tmpfs volume, with no Secret object — is stronger
+but unavailable here, because it requires every service to read files instead
+of environment variables.
+
+**The SecretProviderClass is the whole list of what the cluster knows to ask
+for.** The CSI driver does not scan the vault. A secret added to Key Vault but
+not named in that manifest is never fetched, never appears in
+`tokenfactory-secrets`, and raises no error — it fails silently. That manifest
+is one of the artifacts that is not version-controlled (§12.5), which makes it
+the single most load-bearing unversioned file in the environment.
+
+**Nothing mounts that volume except a placeholder.** The driver only materialises
+a Secret while some pod has the SecretProviderClass volume mounted, and the
+`tf-*` services consume through `secretKeyRef` rather than a volume. The mount is
+therefore held open by **`Deployment/akv-secret-syncer`**, a single-replica pod
+that exists for no other purpose. The name is misleading: it does not
+reconcile anything, it holds a mount.
+
+> `tokenfactory-secrets` carries an `ownerReference` to that Deployment's
+> ReplicaSet, and as of 14 October 2026 there is exactly **one** owner. Kubernetes
+> garbage-collects an object once all its owners are gone, so deleting
+> `akv-secret-syncer` — or scaling it to zero and pruning its ReplicaSet — deletes
+> the Secret, after which every `tf-*` pod fails on its next restart with
+> `CreateContainerConfigError`. The cause would not resemble the trigger.
+> `rollout restart` is safe, because the new ReplicaSet becomes an owner before
+> the old pod terminates. `delete` is not. A second `akv-secret-syncer` with the
+> same property runs in the `cloudflare` namespace.
+
+**Writes are asynchronous, reads are not.** Because secret rotation is enabled on
+the addon at a 2-minute interval, a newly declared object appears in
+`tokenfactory-secrets` on its own, without a restart — verified on 14 October
+2026, when a test secret landed roughly a minute after the SecretProviderClass
+was edited. What a restart is still required for is the **consumer**: a container
+reads its environment once at process start, so a running pod keeps the old value
+until it is rolled.
+
+**The two sets are not identical.** The vault holds 27 secrets; the Kubernetes
+Secret holds 20 keys. The seven not synced are
+`clickhouse-app-password`, `eventhub-connection-string`, `openmeter-db-password`,
+`svix-db-password`, `ghcr-pat`, `ghcr-user` and `pg-admin-password` — OpenMeter
+runs as a separate release in its own namespace with its own Secret, images come
+from ACR rather than ghcr.io, and the Postgres admin password is an operator
+credential no application needs.
+
+**What this design does and does not protect.** Key Vault gives custody and
+lifecycle: nothing is committed to git, rotation has one authoritative point,
+and Terraform can generate a password no human ever reads. What it cannot do is
+hide a value from someone already inside the cluster — the copy in
+`tokenfactory-secrets` is plaintext in etcd and readable by any principal
+holding `get secrets` in the namespace, and a cluster administrator can read a
+process environment regardless. That exposure is a Kubernetes RBAC question, not
+a secret-store question, and no secret backend changes it.
 
 State contains two plaintext secrets. The compensating controls are: the state
 container is private-endpoint-only, `default_action = "Deny"`, versioned, and
@@ -854,7 +943,109 @@ already in place, so enabling logging does not need a firewall change.
 
 For a deployment day, enabling logging first is strongly recommended.
 
-### 12.4 What Terraform Does Not Do
+### 12.4 Adding or Rotating a Secret
+
+Adding a secret to Key Vault is **step one of three**. On its own it has no
+effect on the cluster, and skipping the remaining steps fails silently rather
+than loudly. Never edit `tokenfactory-secrets` by hand — it is a derived object,
+and the CSI driver rewrites it from the vault on the next pod mount, so a
+hand-added key survives until the next rollout and then disappears with no event
+to explain it.
+
+**Step 1 — write the value to the vault.** From the jumphost, where
+`kv-tokenfactory.vault.azure.net` resolves to the private endpoint:
+
+```bash
+az keyvault secret set --vault-name kv-tokenfactory \
+  --name <secret-name> --file /path/to/value --output none
+```
+
+Reading from a file rather than `--value` keeps the secret out of shell history.
+Confirm it landed without printing it:
+
+```bash
+az keyvault secret show --vault-name kv-tokenfactory --name <secret-name> \
+  --query "{name:name, len:length(value), updated:attributes.updated}" -o yaml
+```
+
+**Step 2 — declare it in the SecretProviderClass.** Two entries are required,
+and omitting either one is the usual cause of a secret that is "in the vault but
+not working":
+
+| Block | Purpose | Symptom if missing |
+|---|---|---|
+| `spec.parameters.objects` | what the driver fetches from the vault | never fetched at all |
+| `spec.secretObjects[].data` | what is written into `tokenfactory-secrets` | fetched to the tmpfs mount, but `secretKeyRef` still fails |
+
+```yaml
+spec:
+  parameters:
+    objects: |
+      array:
+        - |
+          objectName: <secret-name>
+          objectType: secret
+  secretObjects:
+    - secretName: tokenfactory-secrets
+      type: Opaque
+      data:
+        - objectName: <secret-name>
+          key: <secret-name>
+```
+
+The SecretProviderClass is named **`tokenfactory-kv`**. Take a copy before
+editing, because the manifest is not in any repository (§12.5):
+
+```bash
+kubectl -n xailon-tf-prod get secretproviderclass tokenfactory-kv -o yaml \
+  > spc-backup-$(date +%Y%m%d-%H%M).yaml
+```
+
+Two indentation levels apply, and they differ. `objects:` is a literal block
+scalar, so its contents are an unparsed string the API server does not validate:
+`- |` sits at 8 spaces and `objectName:` at 10. `secretObjects:` is real YAML:
+`- key:` at 4 spaces and `objectName:` at 6. A wrong indent inside the block
+scalar is accepted at apply time and fails later at mount time.
+
+**Step 3 — wait, then confirm the Secret.** No restart is needed for this part.
+The rotation reconciler polls at a 2-minute interval and writes the new key on
+its own:
+
+```bash
+kubectl -n xailon-tf-prod get secret tokenfactory-secrets \
+  -o jsonpath='{.data.<secret-name>}' | wc -c
+```
+
+A non-zero byte count confirms the key reached the Secret. If it is still zero
+after three minutes, the `secretObjects` entry from step 2 is missing or
+misspelled — and note that the two halves fail differently: an `objects` entry
+without its `secretObjects` pair fetches the value to the tmpfs mount and writes
+nothing, with no error logged anywhere.
+
+**Step 4 — restart the consumers.** A container reads its environment once at
+process start, so a running pod keeps the old value regardless of what the Secret
+now holds:
+
+```bash
+kubectl -n xailon-tf-prod rollout restart deploy/<name>
+```
+
+**Rotating an existing secret is different from adding one.** The key is already
+declared, so step 2 is unnecessary and the reconciler updates the Secret in place
+with no action at all — but the running pods keep the old value in their
+environment until they are restarted, so step 4 still applies. For `redis-password` and
+`pg-admin-password` the rotation must originate from Terraform, not the portal:
+both are declared resources, and the next `apply` overwrites a manually changed
+value (§8.2).
+
+**Getting the value into the application is a separate question.** A key present
+in `tokenfactory-secrets` is still unread unless a container references it. If
+the secret maps to an existing chart key under `global.secrets.*`, set that key
+in the overlay and upgrade through Helm. If it does not, the chart has no
+`secretKeyRef` for it and the value sits unused — that requires a chart change,
+not a values change.
+
+### 12.5 What Terraform Does Not Do
 
 After `terraform apply` completes, the environment is **not ready**. These steps
 are manual:
@@ -875,7 +1066,7 @@ are manual:
 `~/Downloads/xalion-backup-20261013.tgz` (37 K, 30 files, integrity verified),
 but a tarball on a laptop is not version control.
 
-### 12.5 Rebuild From Scratch
+### 12.6 Rebuild From Scratch
 
 **Terraform alone cannot rebuild this environment.** Four blockers:
 
@@ -883,7 +1074,7 @@ but a tarball on a laptop is not version control.
    (§11.1).
 2. **`backend.tf` declares the storage account that holds its own state** — a
    clean `terraform init` has nowhere to initialise from (§4.2).
-3. **The ~8–10 manual steps in §12.4** exist only as unversioned scripts.
+3. **The ~8–10 manual steps in §12.5** exist only as unversioned scripts.
 4. **Two private keys are not in the repository** — the VPN root key and the
    Cloudflare Origin key.
 
