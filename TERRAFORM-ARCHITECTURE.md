@@ -6,7 +6,7 @@
 | **Prepared by** | Sidhant Khanna |
 | **Platform** | Xailon TokenFactory — Azure (UAE North) |
 | **Repository** | `Infinia-Technology/azure-infra-terraform` |
-| **Version** | 1.1 |
+| **Version** | 1.2 |
 | **Last updated** | 15 October 2026 |
 
 ---
@@ -15,71 +15,37 @@
 
 ### 1.1 Purpose & Scope
 
-This repository is the **single source of truth for the Azure infrastructure**
-beneath the Xailon TokenFactory deployment — network, compute, data services,
-identity plumbing and egress control. It stops at the cluster boundary.
+This repository is the **single source of truth for the Azure infrastructure** beneath the Xailon TokenFactory deployment — network, compute, data services, identity plumbing and egress control. It stops at the cluster boundary.
 
 **In scope (Terraform-managed):**
 
-- Resource group, virtual network, all eight subnets, route table, NSGs
-- AKS cluster (private) and both node pools
-- Azure Firewall + policy + the full egress allow-list
-- Azure Database for PostgreSQL Flexible Server and its five databases
-- Azure Managed Redis
-- Azure Container Registry, Key Vault, Event Hubs, two storage accounts
+- Resource group, virtual network, eight subnets, route table, NSGs
+- Private AKS cluster and both node pools
+- Azure Firewall, policy and the full egress allow-list
+- PostgreSQL Flexible Server (five databases) and Azure Managed Redis
+- Container Registry, Key Vault, Event Hubs, two storage accounts
 - DNS Private Resolver, private DNS zones, private endpoints
-- Point-to-Site VPN gateway, Azure Bastion, jumphost VM
+- Point-to-Site VPN gateway, Bastion, jumphost VM
 - Two Key Vault secrets
 
-**Out of scope (not in this repository):**
+**Out of scope:**
 
-- **Everything inside Kubernetes.** The application is deployed by Helm from
-  `Infinia-Technology/ai-gateway-platform` (`helm/tokenfactory`, overlay
-  `values-xailon-prod.yaml`). No Kubernetes resource is managed here.
+- **Everything inside Kubernetes** — deployed by Helm from `Infinia-Technology/ai-gateway-platform` (overlay `values-xailon-prod.yaml`).
 - **Cloudflare configuration** — tunnel, DNS records, Origin certificate.
-- **Entra ID role assignments for human operators.** Deliberately excluded:
-  each person arrives with their own identity and gets exactly what their own
-  Azure RBAC grants.
-
-On Azure the infrastructure is code, and this repository is that code.
+- **Entra ID role assignments for human operators** — each person gets what their own Azure RBAC grants.
 
 ### 1.2 Design Principles
 
-Four decisions shape everything below. Each is load-bearing; the consequences
-are spelled out under One-Way Doors.
-
-1. **Private by default.** Every PaaS service has
-   `public_network_access_enabled = false` and is reached through a private
-   endpoint in `snet-pe`. The AKS API server is private. There is no public
-   ingress into the VNet at all — inbound traffic arrives through a Cloudflare
-   Tunnel initiated *outbound* from a pod.
-2. **All egress through the firewall.** AKS, management and PostgreSQL subnets
-   route `0.0.0.0/0` to the Azure Firewall private IP.
-   Nothing leaves the VNet without matching an
-   explicit rule. A missed FQDN fails as an application-level timeout, not as a
-   visible network error.
-3. **Deny-by-default inside the VNet too.** Every NSG ends with
-   `Deny-VNet-Inbound` at priority 4096, so subnet-to-subnet traffic is
-   allow-listed rather than assumed.
-4. **No ambient credentials on any VM.** The jumphost has a system-assigned
-   managed identity solely because the Entra SSH extension requires one, and
-   that identity is **deliberately granted no role at all**
-   (`jumphost.tf`). Operators authenticate as themselves.
+1. **Private by default.** Every PaaS service has public access disabled and is reached through a private endpoint in `snet-pe`. The AKS API server is private. Inbound application traffic arrives through a Cloudflare Tunnel initiated *outbound* from a pod.
+2. **All egress through the firewall.** AKS, management and PostgreSQL subnets route `0.0.0.0/0` to Azure Firewall. A missed FQDN fails as an application timeout, not a visible network error.
+3. **Deny-by-default inside the VNet.** Every NSG ends with `Deny-VNet-Inbound` at priority 4096.
+4. **No ambient credentials on any VM.** The jumphost's managed identity exists only because the Entra SSH extension requires one, and holds no role. Operators authenticate as themselves.
 
 ### 1.3 Infrastructure Lifecycle
 
-The lifecycle is: **write → validate → plan → apply → verify → operate**.
-Changes are authored as HCL in this repository and reviewed through a pull
-request. They are then planned and applied **by hand from the jumphost** —
-there is no pipeline and no automated apply. Every apply is followed by
-a plan that must report no changes. Environments do not promote: there is
-a single production environment.
+**write → validate → plan → apply → verify → operate.** Changes are authored as HCL, reviewed through a pull request, then planned and applied **by hand from the jumphost**. There is no pipeline and no automated apply. Every apply is followed by a plan that must report no changes. There is a single production environment, so nothing is promoted.
 
-This document is organised around that lifecycle: the architecture, how
-a change is made, checked and deployed, what is deployed, how it is built
-and how it is secured, and how it is run, maintained, recovered and released.
-It is written for **operators who will modify the environment**, and for
-security and management reviewers.
+This document follows that lifecycle and is written for operators who modify the environment, and for security and management reviewers.
 
 ---
 
@@ -116,22 +82,7 @@ security and management reviewers.
 
 ### 2.2 Resource Inventory
 
-72 `resource` blocks, 2 `data` sources, 1 `output`, 22 variables. With `for_each`
-expansion these become **89 addresses in state**, which
-reconciles as:
-
-| | Count |
-|---|---|
-| `resource` blocks as written | 72 |
-| `azurerm_eventhub.this` — `for_each` over 7 event hubs | +6 |
-| `azurerm_subnet.this` — `for_each` over 6 subnets | +5 |
-| `azurerm_postgresql_flexible_server_database.pg_db` — `for_each` over 5 databases | +4 |
-| **Managed resources in Azure** | **87** |
-| `data` sources, which `terraform state list` also prints | +2 |
-| **Total state entries** | **89** |
-
-The distinction matters when reading the figure elsewhere: 87 things exist in
-Azure; the other two are data reads re-evaluated on every plan.
+72 `resource` blocks expand to 87 managed resources via `for_each` (+6 event hubs, +5 subnets, +4 databases). With 2 `data` sources, `terraform state list` shows **89 entries**.
 
 | Service | Resource | Key configuration |
 |---|---|---|
@@ -167,10 +118,7 @@ Azure; the other two are data reads re-evaluated on every plan.
 | `privatelink.blob.core.windows.net` | both storage accounts |
 | `privatelink.servicebus.windows.net` | Event Hubs |
 
-Do not substitute `privatelink.redisenterprise.cache.azure.net` — it looks
-correct because it matches the ARM type, but it belongs to the older Azure Cache
-for Redis Enterprise product, and the private endpoint would register in a zone
-no client queries.
+Do not use `privatelink.redisenterprise.cache.azure.net` for Redis — it belongs to the older Azure Cache for Redis Enterprise product, and no client queries it.
 
 ### 2.4 Subnets
 
@@ -185,22 +133,13 @@ no client queries.
 | `snet-dnsr-inbound` | `10.40.4.0/28` | 11 | `Microsoft.Network/dnsResolvers` | — | — |
 | `snet-aks` | `10.40.8.0/21` | 2043 | — | `nsg-aks` | ✅ |
 
-The three delegated/platform subnets must be dedicated — nothing else may live
-in them. Azure reserves the first four and last address of every subnet, which is
-why the resolver's static IP is `.4`, the first usable address in its `/28`.
+Delegated and platform subnets must be dedicated. Azure reserves the first four and the last address of every subnet.
 
 ### 2.5 Routing
 
-`rt-tokenfactory` sends `0.0.0.0/0` to `VirtualAppliance` at the firewall's
-private IP, associated to `snet-aks`, `snet-mgmt` and `snet-pg`. AKS is created
-with `outbound_type = userDefinedRouting`, which means **the cluster has no
-outbound internet path of its own** — if the route table or a firewall rule is
-wrong, the symptom is nodes that never register or images that never pull.
+`rt-tokenfactory` sends `0.0.0.0/0` to the firewall's private IP for `snet-aks`, `snet-mgmt` and `snet-pg`. AKS uses `outbound_type = userDefinedRouting`, so the cluster has no outbound path of its own: a wrong route or firewall rule shows up as nodes that never register or images that never pull.
 
 ### 2.6 Network Security Groups
-
-All three subnet NSGs follow the same shape: specific allows, then
-`Deny-VNet-Inbound` at priority 4096.
 
 | NSG | Allows inbound |
 |---|---|
@@ -209,43 +148,20 @@ All three subnet NSGs follow the same shape: specific allows, then
 | `nsg-aks` | node-to-node from `10.40.8.0/21` **and `10.244.0.0/16`** (100), all from `snet-mgmt` (110), **`AzureLoadBalancer` (120)** |
 | `nsg-jumphost` | 22 from `10.40.0.64/26` (AzureBastionSubnet) only |
 
-Two rules on `nsg-aks` are the ones that break things when missing:
-
-- **The pod CIDR in `Allow-Node-To-Node`.** With CNI Overlay, pod traffic
-  carries a `10.244.0.0/16` source address that is not part of the VNet, so a
-  rule listing only the node subnet silently drops pod-to-pod traffic.
-- **`Allow-AzureLoadBalancer` at priority 120.** Azure's default
-  `AllowAzureLoadBalancerInBound` sits at 65001, *below* the explicit
-  `Deny-VNet-Inbound` at 4096, so the deny wins and every load-balancer health
-  probe fails. The explicit rule restores it above the deny.
+- The **pod CIDR** must be in `nsg-aks` node-to-node: CNI Overlay pod traffic has a `10.244.0.0/16` source outside the VNet and is silently dropped otherwise.
+- **`Allow-AzureLoadBalancer` (120)** must sit above the deny at 4096, or every load-balancer health probe fails.
 
 ### 2.7 DNS
 
-```
-VPN client ──► vnet.dns_servers = 10.40.4.4 ──► dnsr inbound endpoint
-                                                        │
-                                          VNet-linked private DNS zones
-```
+VPN client → `vnet.dns_servers = 10.40.4.4` → resolver inbound endpoint → VNet-linked private DNS zones.
 
-`azurerm_virtual_network_gateway`'s `vpn_client_configuration` block **has no
-`dns_servers` argument** (schema-verified), so the VNet's own `dns_servers` is
-the only way to give P2S clients private DNS.
-
-That field used to be `168.63.129.16`, Azure's platform resolver, **and that was
-a bug**. That address is reachable only from inside an Azure VM, never over a P2S
-tunnel. Pushed to a client, every DNS query on the laptop went there and timed
-out — presenting as "the internet dies the moment I connect to the VPN".
-
-The resolver's IP is **static by design**. A dynamic one would force
-`azurerm_virtual_network.dns_servers` to reference the resolver's output, creating
-a `vnet → subnet → resolver → inbound → vnet` cycle. Both sides reading the same
-variable breaks the cycle.
+- The VPN gateway block has no `dns_servers` argument, so the VNet's own setting is the only way to give P2S clients private DNS.
+- It used to point at `168.63.129.16`, which is unreachable over a P2S tunnel; clients lost all DNS on connect.
+- The resolver IP is static to avoid a `vnet → subnet → resolver → vnet` dependency cycle.
 
 ### 2.8 Egress Allow-List
 
-`firewall.tf` is the largest file in the repository: one rule collection group,
-`aks-bootstrap`, holding 9 application rule collections and 2 network rule
-collections.
+`firewall.tf` holds one rule collection group (`aks-bootstrap`) with 9 application and 2 network rule collections.
 
 | Priority | Collection | Source | Purpose |
 |---|---|---|---|
@@ -262,40 +178,11 @@ collections.
 | 110 | `aks-dockerhub-init-images` | AKS | three hardcoded initContainer images |
 | 111 | `github-and-maven` | mgmt + AKS | git, GeoIP release download, Maven Central |
 
-Five of these carry non-obvious reasoning worth repeating:
-
-- **106 is usually unnecessary.** Images are brought in with `az acr import`,
-  which runs inside ACR's own service and never traverses this firewall; AKS then
-  pulls from ACR over a private endpoint. These rules matter only for a direct
-  pull from a public registry.
-- **110 exists because three initContainer images are hardcoded in chart
-  templates**, bypassing `global.imageRegistry`: `busybox:1.36` (minio),
-  `busybox:1.36@sha256:…` (tf-auth wait-for-migrate — digest-pinned, no values
-  override at all), `curlimages/curl:8.11.1` (tf-ledger geoip-fetch). A Docker
-  Hub pull needs **three** hosts — `registry-1.docker.io` (manifest),
-  `auth.docker.io` (token), `production.cloudflare.docker.com` (layer blobs).
-  Opening only the first gets the manifest and then stalls in
-  `ImagePullBackOff` with no useful error.
-- **108 must be a network rule, not an application rule.** `cloudflared`
-  connects on port **7844** (QUIC over UDP, HTTP/2 over TCP as fallback), and
-  Azure Firewall application rules handle HTTP/HTTPS only. It uses IP ranges
-  rather than FQDNs because FQDNs in network rules require DNS proxy on the
-  policy, which is off — and enabling it introduces its own failure mode where
-  client and firewall resolve different addresses.
-- **111 includes `repo1.maven.org` for AKS** because Keycloak's providers
-  initContainer pulls the 2FA email authenticator jar from there. Without it the
-  jar is missing, Keycloak starts without the provider, and **tf-auth's bootstrap
-  fails closed and crashloops**.
-- **105's `ods.opinsights` entry is a wildcard** because the ingestion endpoint is
-  workspace-specific (the workspace ID is the hostname), so changing workspaces
-  will not break the rule.
-
-> **`aks-app-egress` (107) is explicitly marked unconfirmed in the code.** Its
-> FQDN list was derived from which services production uses, not from the Xailon
-> application's own configuration. A missing endpoint is blocked **silently** and
-> surfaces as an application timeout. The deny logs that would diagnose it come
-> from `AzureDiagnostics | where Category == "AZFWApplicationRule"` — which
-> **requires `logging.tf.disabled` to be enabled first**.
+- **106** is rarely needed: images are imported with `az acr import` and pulled from ACR over a private endpoint.
+- **110** exists because three chart initContainer images bypass `global.imageRegistry`. A Docker Hub pull needs three hosts (`registry-1.docker.io`, `auth.docker.io`, `production.cloudflare.docker.com`); opening fewer stalls in `ImagePullBackOff`.
+- **108** must be a network rule: cloudflared uses port 7844 and application rules handle HTTP/HTTPS only.
+- **111** includes `repo1.maven.org` because Keycloak's providers initContainer pulls a jar from it; without it tf-auth crashloops.
+- **107 is marked unconfirmed in the code.** A missing endpoint is blocked silently; diagnosing it needs firewall deny logs, which require `logging.tf.disabled` to be enabled.
 
 ---
 
@@ -303,8 +190,7 @@ Five of these carry non-obvious reasoning worth repeating:
 
 ### 3.1 Repository Structure
 
-21 configuration files, flat layout — **no modules**. The environment is a
-singleton, so the indirection would buy nothing.
+21 configuration files, flat layout, **no modules** (the environment is a singleton).
 
 | File | Lines | Contents |
 |---|---:|---|
@@ -331,46 +217,25 @@ singleton, so the indirection would buy nothing.
 | `logging.tf.disabled` | 364 | Log Analytics, diagnostic settings, AMA — **off** |
 | `grafana.tf.disabled` | 134 | Azure Monitor workspace, Managed Prometheus, Managed Grafana — **off** |
 
-Also committed: `.gitignore`, `.terraform.lock.hcl` (provider checksum lock) and
-`tokenfactory-terraform-file-reference.xlsx`.
+Also committed: `.gitignore`, `.terraform.lock.hcl` and `tokenfactory-terraform-file-reference.xlsx`.
 
 ### 3.2 Comment Style
 
-Comments in this repository carry **decision records, not descriptions**. The
-pattern is: what was tried, what Azure returned verbatim, and why the current
-form is the answer. `redis.tf` is the clearest example — the `NoCluster` block
-records why the policy was chosen, the ordered migration plan, and the
-`terraform plan` output to check for before flipping the policy.
-
-This is deliberate. Several settings in this configuration are indistinguishable
-from arbitrary choices until you know what the alternative did, and the comment
-is the only place that knowledge lives.
+Comments are **decision records, written in English**: what was tried, what Azure returned, and why the current form is the answer. `redis.tf` is the clearest example.
 
 ### 3.3 Git / Branching Strategy
 
-**Branch protection is on** for `azure-infra-terraform`: changes must go through
-a pull request. Direct pushes to `main` are rejected.
-
-- **`main` is the source of truth.** The jumphost is a checkout of it
-  (`git pull`); nothing is edited on the jumphost.
-- **Every change is a pull request** against `main`. The `plan` output for the
-  change is the artefact a reviewer needs.
-- Required-reviewer count, commit-message convention and release tagging are not
-  documented here and no tags are cut.
+- **Branch protection is on** for `main`: changes go through a pull request and direct pushes are rejected.
+- The jumphost is a checkout of `main` (`git pull`); nothing is edited there.
+- Reviewer count, commit-message convention and release tagging are not defined.
 
 ### 3.4 Coding & Configuration Standards
 
-- **Flat layout, no modules** — one file per service. The environment is a
-  singleton.
-- **Comments are decision records, written in English**.
-- **Variables** live in `variables.tf`, all defaulted except `p2s_root_cert_data`.
-  `terraform.tfvars` holds only that value, and it is a public certificate.
-- **Parked configuration** is renamed `*.tf.disabled`: Terraform ignores it, the
-  history is kept, and re-enabling is a `git mv`.
-- **Provider versions are pinned** and the lock file is committed.
-- **Settings that look redundant are drift suppression** and must not be cleaned
-  up. **The settings listed under One-Way Doors are irreversible** and need an explicit
-  call-out in the pull request.
+- One file per service; flat layout, no modules.
+- Variables live in `variables.tf`; `terraform.tfvars` holds only a public certificate.
+- Parked configuration is renamed `*.tf.disabled`; re-enabling is a `git mv`.
+- Provider versions are pinned and the lock file is committed.
+- Settings that look redundant are drift suppression — do not clean them up. Settings under One-Way Doors are irreversible and must be called out in the pull request.
 
 ---
 
@@ -378,43 +243,21 @@ a pull request. Direct pushes to `main` are rejected.
 
 ### 4.1 Build Process
 
-There is **no build step and no CI pipeline** for this repository. Terraform is
-interpreted; the nearest thing to a build artefact is the saved plan
-produced on the jumphost and applied unchanged.
-
-This is a gap, not an omission. `terraform plan` needs VNet-internal execution,
-so a hosted runner cannot run it. Static checks (formatting, linting,
-secret scanning) do not need network access and could run on every pull request.
+There is **no build step and no CI pipeline**. The nearest artefact is the saved plan produced on the jumphost and applied unchanged. `terraform plan` needs VNet-internal execution, so a hosted runner cannot run it; static checks could still run on every pull request.
 
 ### 4.2 Validation & Testing
 
-Checks performed today are manual:
-
-- `terraform plan` against the unchanged configuration must print **No changes**.
-- HCL parse of all 21 files, including both `.disabled` files.
-- Spot-checks of declared versus live attributes.
+Checks are manual: `terraform plan` on unchanged configuration must print **No changes**, HCL parse of all 21 files, and spot-checks of declared versus live attributes.
 
 ### 4.3 Security & Vulnerability Scanning
 
-Audited 12 October 2026, clean on all counts: no hardcoded secrets, no private
-keys, no state files, no backups or binaries. `.gitignore` covers `.terraform/`,
-`*.tfplan`, `*.tfstate*`, `*.pem`, `*.p12`, `*.csr`, `*.key`, `*.srl`,
-`cert-base64.txt`, `jumphost_azure_login.txt` and local scratch patterns.
-
-The only IP literals remaining in the configuration are `168.63.129.16` (an Azure
-platform constant) and Cloudflare's published tunnel ranges `198.41.192.0/24`
-and `198.41.200.0/24`. An operator's personal public IP in a commented
-`ip_rules` line was removed.
-
-No automated scanner runs against the repository. **Recommended:** secret
-scanning on push, and a policy scanner (`checkov` or `trivy config`) on pull
-requests, which would also catch a public-access regression.
+- Repository audited 12 October 2026: no hardcoded secrets, private keys, state files or binaries. `.gitignore` covers `.terraform/`, `*.tfplan`, `*.tfstate*`, keys and certificates, and local scratch files.
+- The only IP literals are `168.63.129.16` (Azure platform constant) and Cloudflare's tunnel ranges `198.41.192.0/24` and `198.41.200.0/24`.
+- No automated scanner runs against the repository.
 
 ### 4.4 Provider Supply Chain
 
-`.terraform.lock.hcl` is committed, so provider versions and checksums are
-identical on every machine. No container images are built from this
-repository; images are imported into ACR by a manual script.
+`.terraform.lock.hcl` is committed, so provider versions and checksums are identical on every machine. No container images are built here; images are imported into ACR by a manual script.
 
 ---
 
@@ -430,25 +273,7 @@ operator ──P2S VPN or Bastion──► vm-jumphost (10.40.1.4) ──► ter
 
 Working directory: `azureuser@10.40.1.4:~/terraform_tokenfactory`
 
-This is **not a preference, it is a requirement.** The configuration makes
-data-plane calls that only succeed from inside the VNet:
-
-| Resource | Why it needs VNet-internal execution |
-|---|---|
-| `azurerm_key_vault_secret.pg_admin_password` | Key Vault data plane; the vault has `public_network_access_enabled = false` |
-| `azurerm_key_vault_secret.redis_password` | same |
-| `azurerm_storage_container.eh_capture` | blob data plane on an account with `default_action = "Deny"` |
-| `azurerm_storage_container.tfstate` | same, plus the backend itself reads through `pe-blob-tfstate` |
-
-From outside, these fail with `ForbiddenByConnection` / 403. A storage **IP rule
-does not help**: Azure Storage IP rules only match requests from the public
-internet, and same-region VNet traffic travels the Azure backbone and never
-matches one. A private endpoint is the only correct answer
-(see the header comment in `storage_pe.tf`).
-
-Note that `snet-pe`'s NSG admits `snet-aks` and `snet-mgmt` only — **not** the
-VPN client range `172.16.0.0/24`. Blob access from a laptop stays closed even on
-the VPN. That is intentional.
+This is a requirement, not a preference. Four resources make data-plane calls that only succeed from inside the VNet: the `pg_admin_password` and `redis_password` Key Vault secrets (vault has public access off) and the `eh_capture` and `tfstate` storage containers (account `default_action = "Deny"`). From outside they fail with `ForbiddenByConnection` / 403. A storage IP rule does not help; a private endpoint is the only fix. `snet-pe`'s NSG deliberately does not admit the VPN client range, so blob access from a laptop stays closed.
 
 ### 5.2 Standard Change Workflow
 
@@ -456,29 +281,22 @@ the VPN. That is intentional.
 # on the jumphost
 cd ~/terraform_tokenfactory
 git pull                 # the repo is the source; the jumphost is a checkout
-terraform init            # only after a provider change
+terraform init           # only after a provider change
 terraform plan  -out=tf.plan
 # review every line, then:
 terraform apply tf.plan
 ```
 
-A plan against the unchanged configuration must print
-**`No changes. Your infrastructure matches the configuration.`** Any drift is
-investigated before anything else is applied.
+A plan against unchanged configuration must print **`No changes. Your infrastructure matches the configuration.`** Investigate any drift before applying anything else.
 
 ### 5.3 Verifying DNS Before an Apply
-
-Private DNS resolution over the VPN is the most common cause of a confusing
-failure. Check it first:
 
 ```bash
 getent hosts kv-tokenfactory.vault.azure.net     # expect 10.40.3.x
 getent hosts psql-tokenfactory.postgres.database.azure.com
 ```
 
-Use `getent` / `getaddrinfo`, **not `dig`**. `dig` queries a DNS server directly
-and bypasses the resolver order the OS actually uses, so it can report success
-while the application path still fails — and vice versa.
+Use `getent`, not `dig`: `dig` bypasses the OS resolver order and can report success while the application path fails.
 
 ### 5.4 Environment Promotion
 
@@ -486,24 +304,16 @@ while the application path still fails — and vice versa.
 |---|---|---|---|
 | production | `rg-tokenfactory` (UAE North) | Manual `plan` → review → `apply` from the jumphost, after merge to `main` | The only environment |
 
-There is **no dev or staging copy** of this infrastructure, so there is no
-promotion path: a change is applied straight to production, and plan review is
-the only gate. Globally unique names are hardcoded, so a parallel environment
-cannot be stood up without editing them. Application environments are
-deployed by Helm and are out of scope.
+There is no dev or staging copy, so plan review is the only gate. Globally unique names are hardcoded, so a parallel environment cannot be created without editing them.
 
 ### 5.5 Rollback
 
-Terraform has no undo. In order of preference:
+Terraform has no undo.
 
-1. **Revert the commit** through a pull request, pull it on the jumphost, then
-   `plan` and `apply`. This works for any in-place change.
-2. **Never apply a stale plan.** If the configuration or the state changed after
-   `tf.plan` was written, discard it and plan again.
-3. **State history.** Blob versioning on the state account keeps earlier state
-   versions. That recovers the *state file*; it does not revert resources.
-4. **Irreversible settings** cannot be rolled back by reverting the code —
-   the resource is destroyed and recreated, or the change is refused.
+1. **Revert the commit** through a pull request, pull it on the jumphost, then plan and apply.
+2. **Never apply a stale plan** — if configuration or state changed after `tf.plan` was written, plan again.
+3. **State history:** blob versioning recovers earlier state files; it does not revert resources.
+4. **Irreversible settings** cannot be rolled back by reverting code.
 
 ---
 
@@ -511,88 +321,22 @@ Terraform has no undo. In order of preference:
 
 ### 6.1 PostgreSQL
 
-Single Flexible Server, VNet-injected into the delegated `snet-pg`, with
-zone-redundant HA (primary zone 1, standby zone 2), 128 GB auto-grow storage and
-30-day geo-redundant backups. Five databases are created by `for_each`.
-
-> **Storage is 128 GB, which provisions 500 IOPS.** Azure couples IOPS to
-> allocated storage on Flexible Server. This is the single capacity number most
-> likely to bite under load and has not been validated against a load test.
+Single Flexible Server, VNet-injected into `snet-pg`, zone-redundant HA, 128 GB auto-grow storage, 30-day geo-redundant backups, five databases. **128 GB provisions only 500 IOPS** (IOPS scale with storage) — the capacity number most likely to bite under load, and not yet load-tested.
 
 ### 6.2 Redis — Why `NoCluster`
 
-This is the most consequential single setting in the repository.
-
-`clusteringPolicy = "NoCluster"` stores data on each node without sharding, so
-**no hash slots exist** and multi-key Lua scripts work with the application's
-keys unchanged.
-
-`EnterpriseCluster` — the obvious-looking choice — gives a single *endpoint* but
-does **not** collapse the key space; it is still sharded. Enterprise policy
-permits only a short list of commands across slots, which excludes the scripted
-multi-key operations the application relies on.
-
-**Constraints accepted with `NoCluster`:** available at ≤ 25 GB only; the policy
-is fixed at create time and can move `NoCluster → clustered` but **not the
-reverse** without deleting the database; and it is less performant, because Redis
-Enterprise multithreads only when the cache is sharded.
-
-**Planned migration (decided 12 October 2026).** Move to `EnterpriseCluster` once
-hash tags ship. The order is not negotiable:
-
-1. Ship hash tags in **tf-ledger and tf-warden together**, with the data
-   migration for `tf:credit:used:<org>` (`seed.go:54`).
-2. Verify in production on this `NoCluster` instance.
-3. **Only then** flip `clusteringPolicy`.
-
-Flipping before the application change breaks the credit scripts immediately.
-On the flip, confirm `terraform plan` says **`update in-place`** — if it says
-`destroy and then create replacement`, **stop**: the database would be deleted.
-
-Two more settings are deliberate:
-
-- **`port = 10000`**, not 6379 — Azure Managed Redis's standalone endpoint port.
-  Clients connect to the cluster hostname, **not** the privatelink hostname,
-  which Microsoft's own troubleshooting guide warns against putting in a
-  connection string.
-- **`evictionPolicy = "NoEviction"`** matches the bundled subchart's deliberate
-  `--maxmemory-policy noeviction`. The credit-wallet counters carry no TTL and
-  must not be evicted; `VolatileLRU` would evict TTL'd keys first, which here
-  means the reservation holds (`tf:{token,credit,projcap}:resv:*`) — a silently
-  dropped hold reopens the in-flight overspend window. `NoEviction` fails writes
-  loudly instead, and both tf-ledger and tf-warden already have fail-closed
-  paths for Redis errors.
-
-**No `zones` block — do not add one back.** ARM rejects it:
-`400: Specifying zones for SKU 'Balanced_B20' is not supported. Zone redundancy
-is enabled by default for this SKU in regions with zones.` Redundancy is not lost
-by omitting it. This is the **opposite** of every other zonal resource here
-(public IPs, the VM, disks), where `zones` is required.
-
-**Sizing and scaling.** `Balanced_B10` is 12 GB; Azure reserves ~20 % for
-non-cache operations, so usable memory is ~9.6 GB against an application cap of
-`maxmemory 3gb`. Scaling works in **both** directions — the authority is
-`listSkusForScaling` asked about this specific cluster, which returns **37
-options**, from `B0` (0.5 GB) up to 1920 GB, of which 12 are ≤ 25 GB and
-therefore keep `NoCluster` available. (Microsoft's architecture page says scaling
-down is unsupported and its how-to-scale page says otherwise; the ARM API
-settles it.) Right-sizing to `Balanced_B5` (6 GB → ~4.8 GB usable) would clear
-the 3 GB cap and cut cost; `B3` would fall below it. `B10` is kept only because
-it is running and nothing is under pressure.
-
-Access keys are read with `sensitive_response_export_values`, not the plain
-variant, so they land in `sensitive_output` and are redacted in plan/apply and
-`terraform output`. They are in state either way.
-
-> **Rotation:** `redis-password` in Key Vault tracks `primaryKey`. Rotating the
-> cache key in Azure does **not** update the secret — a `terraform apply`
-> re-reads `listKeys` and pushes the new value, after which the CSI syncer
-> propagates it.
+- **`clusteringPolicy = NoCluster`** stores data without sharding, so multi-key Lua scripts work unchanged. `EnterpriseCluster` gives one endpoint but still shards keys, and the application's scripts failed with `CROSSSLOT`.
+- **Constraints:** ≤ 25 GB only; the policy is fixed at create time and can move `NoCluster → clustered` but not back without deleting the database.
+- **Planned move to `EnterpriseCluster`** (decided 12 Oct 2026), strictly in order: ship hash tags in tf-ledger and tf-warden together, verify in production on `NoCluster`, then flip the policy. On the flip, the plan must say `update in-place`; if it says `destroy and then create replacement`, stop.
+- **`port = 10000`:** clients connect to the cluster hostname, not the privatelink hostname.
+- **`evictionPolicy = NoEviction`:** credit counters and reservation holds must never be evicted; writes fail loudly instead.
+- **No `zones` block:** ARM rejects it for this SKU, and zone redundancy is on by default.
+- **Sizing:** `Balanced_B10` (12 GB, about 9.6 GB usable) against an application cap of 3 GB. Scaling works in both directions; `Balanced_B5` would still clear the cap.
+- **Rotation:** `redis-password` in Key Vault tracks `primaryKey`; rotating in Azure does not update it until the next `terraform apply`.
 
 ### 6.3 Event Hubs
 
-Standard tier (Kafka protocol requires Standard or above), capacity 1, private
-endpoint only. Seven hubs, 7-day retention (the Standard maximum):
+Standard tier, capacity 1, private endpoint only, 7-day retention. Seven hubs:
 
 | Hub | Partitions | Capture |
 |---|---:|---|
@@ -604,33 +348,9 @@ endpoint only. Seven hubs, 7-day retention (the Standard maximum):
 | `om_sys.billing_worker_dlq` | 1 | ✅ |
 | `om_sys.notification_service_dlq` | 1 | ✅ |
 
-The three DLQ hubs capture to `sttokenfactoryarch001/eventhub-capture`, Avro,
-300 s interval, 300 MB size limit, skipping empty archives.
-
-**Capture required a data-plane RBAC grant on the Terraform principal.** Wiring
-a hub to a storage account triggers a "linked access check": the *caller* must
-hold blob write on that account. `Owner`/`Contributor` **do not satisfy it** —
-they are control-plane roles carrying no blob permission. All three DLQ hubs
-returned:
-
-```
-400: Linked access check failed for capture storage destination …
-     doesn't have the required data plane write permissions
-```
-
-The fix is `Storage Blob Data Owner` on the archive account, plus
-`time_sleep.rbac_propagation`. A managed identity was deliberately not
-used — it is only required when the storage account is in a different
-subscription, and `identity[0].principal_id` does not resolve at plan time
-because the list is still empty in state.
-
-A subtlety that caused confusion during the build: `azurerm_storage_container` is
-created with the **account key** (shared access keys are still enabled), while
-the linked-access check looks at **RBAC** — which is why the container existed
-while the hubs were still failing.
-
-The namespace authorization rule `openmeter-app` grants `listen` + `send`, not
-`manage`.
+- The three DLQ hubs capture to `sttokenfactoryarch001/eventhub-capture` (Avro, 300 s, 300 MB, skip empty).
+- Capture needs `Storage Blob Data Owner` on the archive account for the Terraform principal; `Owner`/`Contributor` do not satisfy the linked-access check.
+- The `openmeter-app` authorization rule grants `listen` + `send` only.
 
 ### 6.4 Storage Accounts
 
@@ -639,40 +359,22 @@ The namespace authorization rule `openmeter-app` grants `listen` + `send`, not
 | `sttokenfactorytfstate001` | **ZRS** | `true` + Deny rules | Terraform state; versioning on |
 | `sttokenfactoryarch001` | LRS | `true` + Deny rules | Event Hubs Capture |
 
-Both set `public_network_access_enabled = true` with
-`network_rules.default_action = "Deny"` and `bypass = ["AzureServices"]`. That
-combination is not a contradiction: the account endpoint exists publicly but
-rejects everything except Azure trusted services, which is **how Event Hubs
-Capture writes** — it uses the trusted-service path, not a private endpoint.
-Operator and Terraform access comes through the private endpoints instead.
+Both use `default_action = "Deny"` with an `AzureServices` bypass: Event Hubs Capture writes through the trusted-service path, while operator and Terraform access uses the private endpoints.
 
 ### 6.5 Container Registry
 
-Premium, `admin_enabled = false`, public access off. AKS pulls through
-`pe-acr-tokenfactory` using an `AcrPull` grant on the kubelet identity, so no
-image pull secret is needed for ACR images.
-
-Images are imported by a script on the jumphost, which is not version-controlled.
+Premium, `admin_enabled = false`, public access off. AKS pulls through `pe-acr-tokenfactory` with an `AcrPull` grant on the kubelet identity. Images are imported by an unversioned script on the jumphost.
 
 ### 6.6 Key Vault
 
-Standard SKU in **RBAC mode** (`enable_rbac_authorization = true`), not access
-policies. Purge protection on, 90-day soft delete, public access off,
-`network_acls` Deny with `AzureServices` bypass.
-
-Two role assignments:
+RBAC mode, purge protection on, 90-day soft delete, public access off. Terraform manages exactly **two** secrets; everything else is seeded outside it.
 
 | Assignment | Principal | Role |
 |---|---|---|
 | `kv_admin_self` | the Terraform caller | Key Vault Administrator |
 | `aks_kv_secrets_user` | AKS Key Vault Secrets Provider addon identity | Key Vault Secrets User |
 
-The addon identity grant is what lets the CSI driver project secrets into pods.
-It is `Secrets User` rather than an access policy precisely because the vault is
-in RBAC mode. Secret rotation is enabled on the addon with a 2-minute interval.
-
-Terraform manages exactly **two** secrets. Everything else in the vault is seeded
-outside Terraform.
+Secret rotation is enabled on the addon at a 2-minute interval.
 
 ### 6.7 AKS
 
@@ -689,39 +391,17 @@ outside Terraform.
 | `azure_policy_enabled` | `true` | Yes |
 | `image_cleaner_enabled` / interval | `true` / 168 h | Yes |
 
-**Authentication is local accounts + Kubernetes RBAC.** The Azure AD RBAC block
-is deliberately not used — access is by exported kubeconfig, not Entra sign-in.
-This is the one place where the "no ambient credentials" principle is relaxed,
-and it is a known difference from the jumphost's Entra-based SSH.
-
-Auto-upgrade is **commented out** in `aks.tf`, so the cluster and node
-images do not update themselves. Upgrades are deliberate actions.
-
-Six nodes total: 3 × D4as_v5 system (critical addons only) + 3 × D8as_v5 user =
-36 vCPU / 144 GB, all spread across zones 1, 2 and 3.
+- Authentication is local accounts plus Kubernetes RBAC via an exported kubeconfig, not Entra sign-in — the one place the "no ambient credentials" principle is relaxed.
+- Auto-upgrade is off; six nodes in total (36 vCPU / 144 GB) across zones 1, 2 and 3.
 
 ### 6.8 Jumphost
 
-`Standard_D2as_v5`, Ubuntu 22.04 LTS gen2, 30 GB Standard_LRS, in `snet-mgmt`.
-Its NSG is attached to the **NIC**, not the subnet, and permits SSH only from
-`AzureBastionSubnet`.
+`Standard_D2as_v5`, Ubuntu 22.04, in `snet-mgmt`; its NSG is on the NIC and allows SSH only from `AzureBastionSubnet`. Two access paths:
 
-It carries two independent access paths, on purpose:
+1. **Entra ID login** (`AADSSHLoginForLinux`): one Linux account per user. `sudo` needs *Virtual Machine Administrator Login*, non-sudo needs *Virtual Machine User Login*; `Owner` and `Contributor` grant no sign-in.
+2. **`azureuser` + SSH key** as break-glass.
 
-1. **Entra ID login** via the `AADSSHLoginForLinux` extension. Each Entra user
-   gets their own Linux account named after their UPN, with its own home
-   directory, its own `~/.azure` token cache, and their real name in `auth.log`.
-   This is what ends the shared-`azureuser` problem. `sudo` comes from the
-   **Virtual Machine Administrator Login** role and non-sudo access from
-   **Virtual Machine User Login** — note that `Owner` and `Contributor` grant
-   **no** VM sign-in at all, because those roles carry no sign-in `dataActions`.
-2. **`azureuser` + SSH key** (`~/.ssh/id_rsa_jumphost`) as the break-glass
-   route. The extension does not remove local accounts.
-
-The VM's system-assigned managed identity exists **only** because the extension
-fails to install without one (exit code 22). It holds **no role assignment**, and
-must never be granted one. A managed identity with no roles cannot open any
-Azure resource; the extension uses it purely as a device identity.
+The system-assigned managed identity exists only because the extension fails to install without one (exit code 22). It holds **no role** and must never be granted one.
 
 ### 6.9 Bastion & VPN
 
@@ -738,15 +418,9 @@ Azure resource; the extension uses it purely as a device identity.
 
 ### 7.1 Infrastructure as Code
 
-Everything beneath the cluster boundary is Terraform in this repository: the
-`azurerm` provider for almost all resources, and `azapi` for Azure Managed
-Redis. The configuration is flat and has no modules. State is remote. There is
-no Terraform Cloud, Atlantis or pipeline wrapper; execution is
-described under Deployment & CD. The application layer (Helm) is a different repository.
+Everything beneath the cluster boundary is Terraform in this repository: `azurerm` for almost all resources and `azapi` for Azure Managed Redis. The layout is flat, state is remote, and there is no Terraform Cloud or pipeline wrapper. The application layer (Helm) is a separate repository.
 
 ### 7.2 State & Backend
-
-State is held in the **`azurerm` remote backend**, declared in `providers.tf`:
 
 | Setting | Value |
 |---|---|
@@ -755,117 +429,43 @@ State is held in the **`azurerm` remote backend**, declared in `providers.tf`:
 | Key | `tokenfactory.tfstate` |
 | Resource group | `rg-tokenfactory` |
 
-Blob versioning is on, which gives state history without a separate backup job.
-There is **no `use_azuread_auth` and no state locking configuration** beyond the
-backend's default blob lease — concurrent applies from two machines are not
-prevented by anything other than convention.
-
-#### 7.2.1 The Backend Block Lives in Exactly One Place
-
-The `backend` block is inside `providers.tf`. Overwriting that file with a copy
-that lacks the block — for example by `scp`-ing from a workstation checkout where
-it was removed — makes Terraform fall back to local state. The next
-`terraform init` then demands `-reconfigure` or `-migrate-state`, and a wrong
-answer there puts all 87 live resources at risk of being treated as new.
-
-**Rule: `providers.tf` is never copied over the jumphost's copy without checking
-the backend block survived.**
-
-#### 7.2.2 Chicken-and-Egg: the State Account Is in Its Own State
-
-`backend.tf` declares `azurerm_storage_account.tfstate` — the account that holds
-the state file that tracks it. This works for the live environment (it was
-created locally, then migrated) but it means a **clean rebuild cannot start from
-`terraform init`**: the backend it points at does not exist yet.
-
-A rebuild requires either bootstrapping with local state and migrating, or
-creating the account by hand first. **This has never been tested**.
+- Versioning gives state history without a separate backup job. There is no state locking beyond the default blob lease, so concurrent applies are prevented only by convention.
+- **The backend block lives only in `providers.tf`.** Copying a version without it onto the jumphost makes Terraform fall back to local state and puts the 87 live resources at risk. Never overwrite that file without checking the block survived.
+- **The state account is in its own state** (`backend.tf`), so a clean rebuild cannot start from `terraform init`. This has never been tested.
 
 ### 7.3 Providers & Version Pinning
 
 | Provider | Constraint | Why |
 |---|---|---|
 | `hashicorp/azurerm` | `~> 3.0` | 87 live resources are planned against 3.x |
-| `Azure/azapi` | `~> 2.0` | Azure Managed Redis — see Why Redis Uses azapi |
+| `Azure/azapi` | `~> 2.0` | Azure Managed Redis |
 | `hashicorp/random` | `~> 3.0` | PostgreSQL admin password |
-| `hashicorp/time` | `~> 0.11` | two propagation waits — see The Two Deliberate Waits |
-
-`.terraform.lock.hcl` is committed, so provider versions and checksums are
-reproducible across machines.
+| `hashicorp/time` | `~> 0.11` | two propagation waits |
 
 #### 7.3.1 Why Redis Uses `azapi`, Not `azurerm`
 
-`azurerm_managed_redis` exists **only in azurerm v4.x**. Upgrading the provider
-for one resource would have put 87 unrelated resources through v4's breaking
-changes, so Redis is declared through `azapi`, which calls the ARM REST API
-directly and is version-independent (see the header comment in `redis.tf`).
-
-The `~> 2.0` pin on `azapi` matters: `azapi` embeds a copy of the ARM schemas and
-validates `type` locally. The final 1.x release stops at
-`Microsoft.Cache/redisEnterprise@2024-06-01-preview`, so a `~> 1.0` pin rejects
-the `2025-04-01` GA version at plan time even though ARM accepts it. Dropping to
-a 2024 API version instead was ruled out — the `Balanced_*` SKU families postdate
-those versions.
-
-When azurerm v4 is adopted (planned separately), the two `azapi_resource` blocks
-can be replaced by a native `azurerm_managed_redis` — same Azure resource, same
-resource IDs, no data migration.
-
-> **Schema validation is not ARM validation.** `azapi`'s embedded schema accepted
-> a `zones` block on the Redis cluster and ARM rejected the PUT with
-> `400: Specifying zones for SKU 'Balanced_B20' is not supported`. It likewise
-> accepted `clusteringPolicy = "NoCluster"` at `2025-04-01`, which ARM also
-> rejected. Treat a clean plan as *well-formed*, not *accepted*.
-
-**The Redis cluster and its database are on different API versions, on purpose.**
-The cluster stays on `2025-04-01` and the database (and `listKeys`) uses
-`2025-07-01` (`redis_api_version` and `redis_db_api_version` in `redis.tf`).
-`NoCluster` is not a valid `clusteringPolicy` before `2025-07-01`; the first
-apply failed with `400: NoCluster clustering policy is not supported in API
-version 2025-04-01`. Moving the cluster itself to `2025-07-01` is not free:
-`properties.publicNetworkAccess` cannot be set on a cluster created under an
-older API version. The consequence is that the portal shows **Public network
-access = "Not set"** rather than "Disabled" — every other private resource here
-sets it explicitly. Traffic still reaches Redis through the private endpoint,
-but "not set" is not the same guarantee as "disabled".
+- `azurerm_managed_redis` exists only in azurerm v4; upgrading for one resource would put 87 others through v4's breaking changes. When v4 is adopted, the two `azapi_resource` blocks can be replaced with no data migration.
+- The `~> 2.0` pin matters: 1.x rejects the `2025-04-01` API version at plan time.
+- **Schema validation is not ARM validation.** `azapi` accepted a `zones` block and `NoCluster` at `2025-04-01`; ARM rejected both. A clean plan means well-formed, not accepted.
+- **The cluster and database use different API versions, on purpose.** The cluster stays on `2025-04-01`; the database and `listKeys` use `2025-07-01`, the first version where `NoCluster` is valid. Moving the cluster would require `publicNetworkAccess`, which cannot be set on a cluster created under an older API version, so the portal shows Public network access **"Not set"** rather than "Disabled". Traffic still goes through the private endpoint, but this is a known gap.
 
 #### 7.3.2 The Two Deliberate Waits
 
-Terraform's dependency graph tracks resource creation, not Azure's internal
-propagation. Two `time_sleep` resources paper over that:
-
-- `time_sleep.rbac_propagation` — 150 s after the `Storage Blob Data Owner`
-  grant. Azure RBAC takes 30 s to a few minutes to apply; without the wait the
-  first apply hits the capture linked-access check before the role is live.
-- `time_sleep.tfstate_pe_dns` — 60 s after the state account's private endpoint,
-  before creating the container, so the private DNS record exists first.
+- `time_sleep.rbac_propagation` — 150 s after the `Storage Blob Data Owner` grant, so the capture linked-access check sees the role.
+- `time_sleep.tfstate_pe_dns` — 60 s after the state account's private endpoint, so its DNS record exists before the container is created.
 
 ### 7.4 Drift Suppression
 
-Three settings exist purely to keep plans clean, because Azure sets them itself
-and the provider defaults differ:
-
-- `upgrade_settings` on both node pools (`max_surge = "10%"`, both timeouts 0) —
-  omitting it showed a `- upgrade_settings` removal on every plan.
-- `vm_agent_platform_updates_enabled = true` on the jumphost — Azure enabled it,
-  the provider defaults to `false`, so every plan showed a `true → false` drift.
-
-These are documented so nobody "cleans them up".
+Two settings exist only to keep plans clean: `upgrade_settings` on both node pools (`max_surge = "10%"`) and `vm_agent_platform_updates_enabled = true` on the jumphost. Azure sets them itself; removing them shows drift on every plan.
 
 ### 7.5 Environment Management
 
-There is one environment. It is described by `variables.tf` (22 variables, all
-defaulted except `p2s_root_cert_data`) and there are no workspaces and no
-per-environment overlays. Standing up a second copy means editing the hardcoded
-globally unique names first.
+One environment, described by `variables.tf` (22 variables, all defaulted except `p2s_root_cert_data`). No workspaces or overlays; a second copy would need the hardcoded globally unique names changed first.
 
 ### 7.6 Configuration Management
 
-- **Infrastructure settings** are Terraform variables with defaults;
-  `kubernetes_version` is the one most often changed.
-- **Secrets are not configuration here.** Two are generated by Terraform and
-  stored in Key Vault; everything else is seeded outside Terraform.
-- **Adding or rotating a secret** is a manual, multi-step procedure.
+- Infrastructure settings are Terraform variables; `kubernetes_version` changes most often.
+- Two secrets are generated by Terraform into Key Vault; everything else is seeded outside Terraform.
 
 ---
 
@@ -873,15 +473,9 @@ globally unique names first.
 
 ### 8.1 Access Management
 
-- **Operators** enter through the P2S VPN or Bastion and land on the jumphost.
-  Each uses their own Entra identity; `azureuser` + key is the
-  break-glass path.
-- **The jumphost's managed identity holds no role** and must never be granted one.
-
-- **Human Azure RBAC is not managed here.** Each person gets what their own
-  assignments grant.
-- **Key Vault** uses RBAC mode, not access policies. **AKS** is reached
-  through an exported kubeconfig, not Entra sign-in.
+- Operators enter through the P2S VPN or Bastion and land on the jumphost with their own Entra identity; `azureuser` + key is break-glass.
+- The jumphost's managed identity holds no role.
+- Human Azure RBAC is not managed here. Key Vault uses RBAC mode; AKS is reached through an exported kubeconfig.
 
 ### 8.2 Secrets Handling
 
@@ -891,102 +485,11 @@ globally unique names first.
 | `redis-password` | Read from ARM `listKeys` → Key Vault (and in state) |
 | Everything else | Seeded outside Terraform |
 
-Secrets reach pods through the **AKS Key Vault Secrets Provider (CSI driver)**.
-The vault is the source of truth; the Kubernetes Secret is a derived copy.
-
-```
-  Terraform apply            operator, az CLI
-  (2 secrets)                (everything else)
-        │                           │
-        └─────────────┬─────────────┘
-                      ▼
-          ┌───────────────────────────┐
-          │   kv-tokenfactory         │   source of truth
-          │   Azure Key Vault, RBAC   │   private endpoint 10.40.3.6
-          └───────────┬───────────────┘
-                      │  addon identity holds Key Vault Secrets User
-                      ▼
-          ┌───────────────────────────┐
-          │ SecretProviderClass       │   declares WHICH secrets to fetch
-          │ tokenfactory-kv           │     objects:       what to read
-          │                           │     secretObjects: what to write
-          └───────────┬───────────────┘
-                      │  mounted by Deployment/akv-secret-syncer
-                      │  written by the rotation reconciler, ~2 min
-                      ▼
-          ┌───────────────────────────┐
-          │ Secret/tokenfactory-      │   derived copy, lives in etcd
-          │   secrets (xailon-tf-prod)│   owned by the syncer's ReplicaSet
-          └───────────┬───────────────┘
-                      │  secretKeyRef
-                      ▼
-          ┌───────────────────────────┐
-          │ tf-* containers           │   environment variables
-          └───────────────────────────┘
-```
-
-**Why a Kubernetes Secret has to exist at all.** The services read their
-credentials from environment variables, and `secretKeyRef` is the only way to
-populate those — it can point at a Secret and nothing else. A pod cannot read
-Key Vault directly. So the CSI driver's `secretObjects` feature writes a real
-Secret, and the chart is pointed at it by
-`global.secrets.existingSecret: "tokenfactory-secrets"`. The alternative the
-driver offers — a mount-only tmpfs volume, with no Secret object — is stronger
-but unavailable here, because it requires every service to read files instead
-of environment variables.
-
-**The SecretProviderClass is the whole list of what the cluster knows to ask
-for.** The CSI driver does not scan the vault. A secret added to Key Vault but
-not named in that manifest is never fetched, never appears in
-`tokenfactory-secrets`, and raises no error — it fails silently. That manifest
-is one of the artifacts that is not version-controlled, which makes it
-the single most load-bearing unversioned file in the environment.
-
-**Nothing mounts that volume except a placeholder.** The driver only materialises
-a Secret while some pod has the SecretProviderClass volume mounted, and the
-`tf-*` services consume through `secretKeyRef` rather than a volume. The mount is
-therefore held open by **`Deployment/akv-secret-syncer`**, a single-replica pod
-that exists for no other purpose. The name is misleading: it does not
-reconcile anything, it holds a mount.
-
-> `tokenfactory-secrets` carries an `ownerReference` to that Deployment's
-> ReplicaSet, and as of 14 October 2026 there is exactly **one** owner. Kubernetes
-> garbage-collects an object once all its owners are gone, so deleting
-> `akv-secret-syncer` — or scaling it to zero and pruning its ReplicaSet — deletes
-> the Secret, after which every `tf-*` pod fails on its next restart with
-> `CreateContainerConfigError`. The cause would not resemble the trigger.
-> `rollout restart` is safe, because the new ReplicaSet becomes an owner before
-> the old pod terminates. `delete` is not. A second `akv-secret-syncer` with the
-> same property runs in the `cloudflare` namespace.
-
-**Writes are asynchronous, reads are not.** Because secret rotation is enabled on
-the addon at a 2-minute interval, a newly declared object appears in
-`tokenfactory-secrets` on its own, without a restart — verified on 14 October
-2026, when a test secret landed roughly a minute after the SecretProviderClass
-was edited. What a restart is still required for is the **consumer**: a container
-reads its environment once at process start, so a running pod keeps the old value
-until it is rolled.
-
-**The two sets are not identical.** The vault holds 27 secrets; the Kubernetes
-Secret holds 20 keys. The seven not synced are
-`clickhouse-app-password`, `eventhub-connection-string`, `openmeter-db-password`,
-`svix-db-password`, `ghcr-pat`, `ghcr-user` and `pg-admin-password` — OpenMeter
-runs as a separate release in its own namespace with its own Secret, images come
-from ACR rather than ghcr.io, and the Postgres admin password is an operator
-credential no application needs.
-
-**What this design does and does not protect.** Key Vault gives custody and
-lifecycle: nothing is committed to git, rotation has one authoritative point,
-and Terraform can generate a password no human ever reads. What it cannot do is
-hide a value from someone already inside the cluster — the copy in
-`tokenfactory-secrets` is plaintext in etcd and readable by any principal
-holding `get secrets` in the namespace, and a cluster administrator can read a
-process environment regardless. That exposure is a Kubernetes RBAC question, not
-a secret-store question, and no secret backend changes it.
-
-State contains two plaintext secrets. The compensating controls are: the state
-container is private-endpoint-only, `default_action = "Deny"`, versioned, and
-reachable only from `snet-aks` / `snet-mgmt`.
+- Secrets reach pods through the **AKS Key Vault Secrets Provider (CSI driver)**: Key Vault → `SecretProviderClass tokenfactory-kv` → `Secret/tokenfactory-secrets` (derived copy) → `secretKeyRef` environment variables.
+- The SecretProviderClass is the whole list of what the cluster fetches. A secret in the vault but not named there is never synced and raises no error. The manifest is not version-controlled.
+- `Deployment/akv-secret-syncer` exists only to hold the CSI mount open. **Do not delete it** — the Secret has that Deployment's ReplicaSet as its only owner, and deleting it makes every `tf-*` pod fail with `CreateContainerConfigError` on restart. `rollout restart` is safe.
+- The vault holds 27 secrets and the Kubernetes Secret 20 keys; the other seven are used elsewhere or by no application.
+- Key Vault gives custody and lifecycle, not secrecy from someone already in the cluster: the Kubernetes Secret is plaintext in etcd for anyone with `get secrets`. State holds two plaintext secrets, protected by the private-endpoint-only, versioned state container.
 
 ### 8.3 Network Security & Closed Surfaces
 
@@ -1004,8 +507,7 @@ reachable only from `snet-aks` / `snet-mgmt`.
 
 ### 8.4 One-Way Doors
 
-Settings that cannot be changed without destroying and recreating the resource.
-Read this section before editing anything in it.
+Settings that cannot change without destroying and recreating the resource.
 
 | Setting | File | Consequence of changing |
 |---|---|---|
@@ -1023,25 +525,13 @@ Read this section before editing anything in it.
 
 ### 8.5 Key Vault Purge Protection
 
-`purge_protection_enabled = true` cannot be turned off once set. A `terraform
-destroy` therefore **soft-deletes** `kv-tokenfactory` and holds the name for
-**90 days**, during which the vault cannot be purged and the name cannot be
-reused. A rebuild in that window fails on vault creation.
-
-This is correct for production data safety and it makes a full
-destroy-and-recreate cycle impossible within a quarter. Plan around it; do not
-discover it during an incident.
+A `terraform destroy` soft-deletes `kv-tokenfactory` and holds the name for **90 days**, so a rebuild in that window fails on vault creation. This is right for production data safety, and it makes a full destroy-and-recreate impossible within a quarter.
 
 ### 8.6 Audit & Compliance
 
-No audit tooling is deployed from this repository today.
-
-- Diagnostic settings and Log Analytics live in `logging.tf.disabled`, so
-  firewall deny logs and resource access logs are **not collected**.
-- Azure's platform Activity Log records control-plane changes without any
-  configuration here, but nothing exports or alerts on it.
-- State history is available through blob versioning.
-- No compliance framework or attestation is documented for this environment.
+- No audit tooling is deployed: diagnostic settings and Log Analytics are in `logging.tf.disabled`, so firewall deny logs and access logs are not collected.
+- Azure's platform Activity Log records control-plane changes by default, but nothing exports or alerts on it.
+- State history comes from blob versioning. No compliance framework or attestation is documented.
 
 ---
 
@@ -1049,10 +539,7 @@ No audit tooling is deployed from this repository today.
 
 ### 9.1 Current Monitoring State
 
-Neither observability stack is deployed. Both were disabled for **cost**.
-There are no alert rules, dashboards or on-call integration defined in
-this repository. The practical effect: a blocked egress FQDN surfaces only as an
-application timeout, and nobody is paged.
+Neither observability stack is deployed; both were disabled for **cost**. No alert rules, dashboards or on-call integration exist in this repository, so a blocked egress FQDN surfaces only as an application timeout and nobody is paged.
 
 ### 9.2 Re-enabling Observability
 
@@ -1062,12 +549,7 @@ git mv grafana.tf.disabled grafana.tf      # Azure Monitor workspace, Prometheus
 terraform plan -out=tf.plan
 ```
 
-Both were disabled for **cost**, not because they do not work. Note that
-`logging.tf` is what makes firewall deny logs visible — without it, blocked
-egress is invisible. The firewall rules for AMA (priority 105) are
-already in place, so enabling logging does not need a firewall change.
-
-For a deployment day, enabling logging first is strongly recommended.
+`logging.tf` is what makes firewall deny logs visible. The AMA firewall rules (priority 105) are already in place. Enabling logging before a deployment day is strongly recommended.
 
 ### 9.3 Health Checks
 
@@ -1080,110 +562,18 @@ For a deployment day, enabling logging first is strongly recommended.
 
 ### 9.4 Daily Operations: Adding or Rotating a Secret
 
-Adding a secret to Key Vault is **step one of three**. On its own it has no
-effect on the cluster, and skipping the remaining steps fails silently rather
-than loudly. Never edit `tokenfactory-secrets` by hand — it is a derived object,
-and the CSI driver rewrites it from the vault on the next pod mount, so a
-hand-added key survives until the next rollout and then disappears with no event
-to explain it.
+Adding a secret takes four steps; skipping any of them fails silently. Never edit `tokenfactory-secrets` by hand — it is a derived object and is rewritten from the vault.
 
-**Step 1 — write the value to the vault.** From the jumphost, where
-`kv-tokenfactory.vault.azure.net` resolves to the private endpoint:
+1. **Write the value to the vault** from the jumphost: `az keyvault secret set --vault-name kv-tokenfactory --name <secret-name> --file <path>` (a file keeps it out of shell history).
+2. **Declare it in `SecretProviderClass tokenfactory-kv`** in two places: `spec.parameters.objects` (what to fetch) and `spec.secretObjects[].data` (what to write into `tokenfactory-secrets`). Back the manifest up first with `kubectl get secretproviderclass tokenfactory-kv -o yaml`.
+3. **Wait about 2 minutes and confirm** the key reached `tokenfactory-secrets`. If not, one of the two entries in step 2 is missing or misspelled.
+4. **Restart the consumers** with `kubectl rollout restart deploy/<name>`; a running pod keeps its old environment.
 
-```bash
-az keyvault secret set --vault-name kv-tokenfactory \
-  --name <secret-name> --file /path/to/value --output none
-```
-
-Reading from a file rather than `--value` keeps the secret out of shell history.
-Confirm it landed without printing it:
-
-```bash
-az keyvault secret show --vault-name kv-tokenfactory --name <secret-name> \
-  --query "{name:name, len:length(value), updated:attributes.updated}" -o yaml
-```
-
-**Step 2 — declare it in the SecretProviderClass.** Two entries are required,
-and omitting either one is the usual cause of a secret that is "in the vault but
-not working":
-
-| Block | Purpose | Symptom if missing |
-|---|---|---|
-| `spec.parameters.objects` | what the driver fetches from the vault | never fetched at all |
-| `spec.secretObjects[].data` | what is written into `tokenfactory-secrets` | fetched to the tmpfs mount, but `secretKeyRef` still fails |
-
-```yaml
-spec:
-  parameters:
-    objects: |
-      array:
-        - |
-          objectName: <secret-name>
-          objectType: secret
-  secretObjects:
-    - secretName: tokenfactory-secrets
-      type: Opaque
-      data:
-        - objectName: <secret-name>
-          key: <secret-name>
-```
-
-The SecretProviderClass is named **`tokenfactory-kv`**. Take a copy before
-editing, because the manifest is not in any repository:
-
-```bash
-kubectl -n xailon-tf-prod get secretproviderclass tokenfactory-kv -o yaml \
-  > spc-backup-$(date +%Y%m%d-%H%M).yaml
-```
-
-Two indentation levels apply, and they differ. `objects:` is a literal block
-scalar, so its contents are an unparsed string the API server does not validate:
-`- |` sits at 8 spaces and `objectName:` at 10. `secretObjects:` is real YAML:
-`- key:` at 4 spaces and `objectName:` at 6. A wrong indent inside the block
-scalar is accepted at apply time and fails later at mount time.
-
-**Step 3 — wait, then confirm the Secret.** No restart is needed for this part.
-The rotation reconciler polls at a 2-minute interval and writes the new key on
-its own:
-
-```bash
-kubectl -n xailon-tf-prod get secret tokenfactory-secrets \
-  -o jsonpath='{.data.<secret-name>}' | wc -c
-```
-
-A non-zero byte count confirms the key reached the Secret. If it is still zero
-after three minutes, the `secretObjects` entry from step 2 is missing or
-misspelled — and note that the two halves fail differently: an `objects` entry
-without its `secretObjects` pair fetches the value to the tmpfs mount and writes
-nothing, with no error logged anywhere.
-
-**Step 4 — restart the consumers.** A container reads its environment once at
-process start, so a running pod keeps the old value regardless of what the Secret
-now holds:
-
-```bash
-kubectl -n xailon-tf-prod rollout restart deploy/<name>
-```
-
-**Rotating an existing secret is different from adding one.** The key is already
-declared, so step 2 is unnecessary and the reconciler updates the Secret in place
-with no action at all — but the running pods keep the old value in their
-environment until they are restarted, so step 4 still applies. For `redis-password` and
-`pg-admin-password` the rotation must originate from Terraform, not the portal:
-both are declared resources, and the next `apply` overwrites a manually changed
-value.
-
-**Getting the value into the application is a separate question.** A key present
-in `tokenfactory-secrets` is still unread unless a container references it. If
-the secret maps to an existing chart key under `global.secrets.*`, set that key
-in the overlay and upgrade through Helm. If it does not, the chart has no
-`secretKeyRef` for it and the value sits unused — that requires a chart change,
-not a values change.
+Rotating an existing secret skips step 2. For `redis-password` and `pg-admin-password`, rotate from Terraform, not the portal, or the next `apply` overwrites the change. A key in the Secret is still unused unless the chart references it through `global.secrets.*`.
 
 ### 9.5 What Terraform Does Not Do
 
-After `terraform apply` completes, the environment is **not ready**. These steps
-are manual:
+After `terraform apply` the environment is **not ready**. These steps are manual:
 
 | Step | Script / artifact |
 |---|---|
@@ -1197,9 +587,7 @@ are manual:
 | Create the TLS secret | Cloudflare Origin certificate, applied by hand |
 | Configure Cloudflare DNS and the tunnel | Cloudflare dashboard |
 
-**This is the largest gap in the repository.** A backup of these scripts exists
-(30 files, integrity verified) and they have since been published to a separate
-repository, but neither is this repository's version control.
+**This is the largest gap in the repository.** The scripts were backed up and published to a separate repository, but they are not under this repository's version control.
 
 ---
 
@@ -1219,44 +607,20 @@ repository, but neither is this repository's version control.
 
 ### 10.2 Kubernetes Upgrades
 
-Auto-upgrade is off. Upgrading is a deliberate change to `kubernetes_version`
-(`variables.tf`, currently `1.35.7`). Check what the region offers first:
-
-```bash
-az aks get-versions --location uaenorth -o table
-```
-
-Both node pools carry `max_surge = "10%"`, so a node pool upgrade adds one
-surge node at a time. The control plane must be upgraded before the node pools,
-and AKS permits only one minor version at a step.
+Auto-upgrade is off. Change `kubernetes_version` in `variables.tf` (currently `1.35.7`) after checking `az aks get-versions --location uaenorth -o table`. Upgrade the control plane before the node pools, one minor version at a time; `max_surge = "10%"` adds one surge node at a time.
 
 ### 10.3 Provider & API-Version Maintenance
 
-- **Providers** are pinned `azurerm ~> 3.0` and `azapi ~> 2.0` with a committed
-  lock file. Upgrading is a deliberate `terraform init -upgrade`
-  followed by a full `plan` that must show no unexpected changes. The planned
-  move to azurerm v4 would also replace the two `azapi_resource` Redis blocks.
-
-- **Redis API version — action needed.** The Redis *cluster* is still on
-  `2025-04-01`. Microsoft has announced the retirement of Azure Managed
-  Redis API versions older than `2025-07-01` on **31 October 2026**; confirm the
-  current notice and plan the cluster's move before that date. The
-  `publicNetworkAccess` constraint above is what makes this a planned change
-  rather than a version bump.
+- Providers are pinned (`azurerm ~> 3.0`, `azapi ~> 2.0`). Upgrade with `terraform init -upgrade` followed by a full plan with no unexpected changes. Moving to azurerm v4 would also replace the two `azapi_resource` Redis blocks.
+- **Action needed — Redis API version.** The Redis cluster is still on `2025-04-01`. Microsoft has announced retirement of Azure Managed Redis API versions older than `2025-07-01` on **31 October 2026**; confirm the notice and plan the cluster's move before then. The `publicNetworkAccess` constraint makes this a planned change, not a version bump.
 
 ### 10.4 Certificate Renewal
 
-Two certificates are managed outside this repository: the **VPN root
-certificate** (its public half is `p2s_root_cert_data`) and the **Cloudflare
-Origin certificate** (applied by hand as a TLS secret). Their expiry dates
-are not recorded here, and nothing alerts before they lapse. Record both dates
-in this section.
+The VPN root certificate (public half in `p2s_root_cert_data`) and the Cloudflare Origin certificate (applied by hand as a TLS secret) are managed outside this repository. Their expiry dates are not recorded and nothing alerts before they lapse; record both here.
 
 ### 10.5 Capacity Management
 
-Capacity is changed by editing variables. Redis is larger than the
-application's 3 GB cap needs and can be right-sized. PostgreSQL storage
-only grows, and its IOPS scale with it.
+Capacity changes are variable edits (see Scaling). Redis is larger than the application's 3 GB cap needs; PostgreSQL storage only grows and its IOPS scale with it.
 
 ---
 
@@ -1271,7 +635,7 @@ only grows, and its IOPS scale with it.
 | Application times out calling an external service | FQDN missing from the firewall allow-list | Add a rule; enable logging to see the deny |
 | Secret is in the vault but the pod does not see it | SecretProviderClass missing a half, or pods not restarted | See Adding or Rotating a Secret |
 | Every plan shows `upgrade_settings` removal or a `true → false` VM agent drift | Drift-suppression setting removed | Restore it |
-| `terraform init` demands `-reconfigure` or `-migrate-state` | Backend block lost from `providers.tf` | See The Backend Block Lives in Exactly One Place |
+| `terraform init` demands `-reconfigure` or `-migrate-state` | Backend block lost from `providers.tf` | Restore the block in `providers.tf` |
 | Redis apply: `NoCluster … not supported in API version 2025-04-01` | Database on the older API version | Database uses `2025-07-01` |
 | Redis apply: `Specifying zones for SKU … is not supported` | `zones` block present | Remove it |
 | Redis `CROSSSLOT` errors from multi-key scripts | `EnterpriseCluster` still shards keys | `NoCluster` |
@@ -1280,23 +644,11 @@ only grows, and its IOPS scale with it.
 
 ### 11.2 Operational Runbooks
 
-| Task | Section |
-|---|---|
-| Make a change | Standard Change Workflow |
-| Verify DNS before an apply | Verifying DNS Before an Apply |
-| Add or rotate a secret | Daily Operations: Adding or Rotating a Secret |
-| Scale a component | Scaling |
-| Upgrade Kubernetes | Kubernetes Upgrades |
-| Re-enable logging and Grafana | Re-enabling Observability |
-| Change the Redis clustering policy | Redis — Why NoCluster |
-
-The post-apply scripts are not version-controlled and so are not
-runbooks yet.
+Procedures live in this document: Standard Change Workflow, Verifying DNS Before an Apply, Adding or Rotating a Secret, Scaling, Kubernetes Upgrades, Re-enabling Observability, and Redis — Why NoCluster (clustering-policy change). The post-apply scripts are not version-controlled, so they are not runbooks yet.
 
 ### 11.3 Incident Management
 
-No incident tooling, on-call rota or alert delivery is defined here.
-Incidents so far are recorded as decision comments in the code and under Common Issues.
+No incident tooling, on-call rota or alert delivery is defined. Past incidents are recorded as decision comments in the code and under Common Issues.
 
 ### 11.4 Backup & Restore
 
@@ -1306,39 +658,26 @@ Incidents so far are recorded as decision comments in the code and under Common 
 | Terraform state | Blob versioning on a ZRS account |
 | Event Hubs | 7-day retention, capture to the archive storage account |
 | Key Vault | Soft delete and purge protection |
-| Post-apply scripts and manifests | A single tarball on a laptop  — **not** adequate |
+| Post-apply scripts and manifests | A single tarball on a laptop — **not** adequate |
 
-Redis persistence is not enabled in `redis.tf`. What the application needs to
-recover after a cache loss, and whether any restore procedure has been rehearsed
-for PostgreSQL, are not documented here.
+Redis persistence is off. A PostgreSQL restore rehearsal and the application's recovery needs after a cache loss are not documented.
 
 ### 11.5 Disaster Recovery & Rebuild From Scratch
 
-The environment is single-region (UAE North). PostgreSQL, Redis and the VPN
-gateway are zone-redundant, which covers a zone failure but not a regional one.
-No DR site, RTO or RPO is defined.
+The environment is single-region (UAE North). PostgreSQL, Redis and the VPN gateway are zone-redundant, which covers a zone failure but not a regional one. No DR site, RTO or RPO is defined.
 
 **Terraform alone cannot rebuild this environment.** Four blockers:
 
-1. **Key Vault purge protection** holds the name for 90 days after a destroy.
+1. Key Vault purge protection holds the name for 90 days after a destroy.
+2. `backend.tf` declares the storage account that holds its own state.
+3. The ~8–10 manual steps under What Terraform Does Not Do exist only as unversioned scripts.
+4. Two private keys (VPN root, Cloudflare Origin) are not in the repository.
 
-2. **`backend.tf` declares the storage account that holds its own state** — a
-   clean `terraform init` has nowhere to initialise from.
-3. **The ~8–10 manual steps described under What Terraform Does Not Do** exist
-   only as unversioned scripts.
-4. **Two private keys are not in the repository** — the VPN root key and the
-   Cloudflare Origin key.
-
-Globally unique names (`acrtokenfactory`, both storage accounts,
-`kv-tokenfactory`) are also hardcoded rather than suffixed, so a parallel
-environment cannot be stood up without editing them.
-
-**A rebuild has never been tested.** Treat the recovery time as unknown until it
-has been.
+Globally unique names are hardcoded, so a parallel environment needs edits first. **A rebuild has never been tested**; treat the recovery time as unknown.
 
 ### 11.6 Rollback Procedures
 
-See Rollback, under Deployment & CD. Irreversible settings are listed under One-Way Doors.
+See Rollback under Deployment & CD. Irreversible settings are listed under One-Way Doors.
 
 ---
 
@@ -1346,36 +685,21 @@ See Rollback, under Deployment & CD. Irreversible settings are listed under One-
 
 ### 12.1 Release Process
 
-A "release" of this infrastructure is a commit on `main` that has been applied.
-There are no version tags or release branches. The flow is: branch → pull request
-→ review of the `plan` → merge → `git pull` on the jumphost → `plan` → `apply`
-→ post-apply validation. The commit that was verified is recorded in the
-version history.
+A release is a commit on `main` that has been applied; there are no tags or release branches. Flow: branch → pull request → review of the `plan` → merge → `git pull` on the jumphost → `plan` → `apply` → post-apply validation. The verified commit is recorded in the version history.
 
 ### 12.2 Change Management
 
 - Every change goes through a pull request; direct pushes to `main` are rejected.
-
-- **Attach the `plan` output to the pull request** (*Recommended*) so the reviewer
-  sees what will happen, not just the diff.
-- Any change touching a setting listed under One-Way Doors must say so in the
-  description, because
-  it destroys the resource or cannot be reverted.
-- Firewall and NSG edits affect every workload's egress and ingress; review them
-  against the Network Security Groups and Egress Allow-List sections.
-- A `destroy and then create replacement` line in a plan on a stateful resource
-  is a **stop**, not a warning.
+- Any change touching a One-Way Door must say so in the description.
+- Firewall and NSG edits affect every workload; review them against the Network Security Groups and Egress Allow-List sections.
+- A `destroy and then create replacement` line on a stateful resource is a **stop**, not a warning.
 
 ### 12.3 Post-Apply Validation
 
-1. `terraform plan` prints **No changes. Your infrastructure matches the
-   configuration.**
-2. `getent hosts` for Key Vault and PostgreSQL returns `10.40.3.x` addresses.
-
-3. `terraform state list` count matches the figure under Accuracy
-   Verification; record any change.
-4. If a secret changed, confirm it reached `tokenfactory-secrets` and restart
-   its consumers.
+1. `terraform plan` prints **No changes. Your infrastructure matches the configuration.**
+2. `getent hosts` for Key Vault and PostgreSQL returns `10.40.3.x`.
+3. `terraform state list` count matches Accuracy Verification; record any change.
+4. If a secret changed, confirm it reached `tokenfactory-secrets` and restart its consumers.
 5. Update the version history.
 
 ### 12.4 Accuracy Verification
@@ -1389,12 +713,12 @@ version history.
 | Secret / key / state scan of the repository | Clean | 12 Oct 2026 |
 | Block counts in the resource inventory | 72 `resource`, 2 `data`, 1 `output`, 22 `variable` | 13 Oct 2026 |
 
-Every figure in this document comes from the configuration files or from a
-command run against the live environment. Nothing in it is inferred.
+Every figure in this document comes from the configuration files or from a command run against the live environment.
 
 ### 12.5 Version History
 
 | Version | Date | Author | Change |
 |---|---|---|---|
-| 1.0 | 13 Oct 2026 | Sidhant Khanna | First issue. Covers `main` at `417dc58`, 24 files on origin, 89 entries in state. |
+| 1.0 | 13 Oct 2026 | Sidhant Khanna | First issue. Covers `main` at `417dc58`, 25 files on origin, 89 entries in state. |
 | 1.1 | 15 Oct 2026 | Sidhant Khanna | Restructured around the infrastructure lifecycle; added missing sections. |
+| 1.2 | 15 Oct 2026 | Sidhant Khanna | Condensed each subsection to a short summary; exact values kept in tables. |
