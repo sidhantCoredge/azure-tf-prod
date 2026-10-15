@@ -10,3 +10,6 @@ arch-diag-links
 
 # DevOps overview document:
 XAILON-OVERVIEW.md
+
+# Low-level design document:
+XAILON-TOKENFACTORY-LLD.md
